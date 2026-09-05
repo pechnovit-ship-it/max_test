@@ -29,50 +29,55 @@ AZS_LIST = [
 ]
 user_states = {}
 
-def get_user_id(event):
-    """Получить ID пользователя из любого объекта event"""
-    if hasattr(event, 'user_id'):
-        return str(event.user_id)
-    if hasattr(event, 'sender') and hasattr(event.sender, 'id'):
-        return str(event.sender.id)
-    if hasattr(event, 'message') and hasattr(event.message, 'sender') and hasattr(event.message.sender, 'id'):
-        return str(event.message.sender.id)
+def get_chat_id(event):
+    """Получить chat_id из события"""
+    if hasattr(event, 'chat_id'):
+        return str(event.chat_id)
+    if hasattr(event, 'message') and hasattr(event.message, 'chat_id'):
+        return str(event.message.chat_id)
     return None
+
+async def send_message(event, text):
+    """Универсальная отправка сообщения"""
+    chat_id = get_chat_id(event)
+    if chat_id:
+        await bot.send_message(chat_id, text)
+    else:
+        logging.error("Не удалось определить chat_id")
 
 # --- ОБРАБОТЧИКИ ---
 @dp.bot_started()
 async def start(event: BotStarted):
-    await event.reply("👋 Привет! Напиши /start")
+    await send_message(event, "👋 Привет! Напиши /start")
 
 @dp.message_created(CommandStart())
 async def cmd_start(event: MessageCreated):
-    user_id = get_user_id(event)
-    if not user_id:
-        await event.reply("❌ Не удалось определить пользователя")
+    chat_id = get_chat_id(event)
+    if not chat_id:
+        await send_message(event, "❌ Не удалось определить чат")
         return
-    user_states[user_id] = {"step": "azs"}
+    user_states[chat_id] = {"step": "azs"}
     msg = "⛽ Выбери АЗС, написав её номер:\n\n"
     for azs in AZS_LIST:
         msg += f"{azs['id']} — {azs['name']} ({azs['address']})\n"
     msg += "\nНапример, напиши 1"
-    await event.reply(msg)
+    await send_message(event, msg)
 
 @dp.message_created(F.message.body.text)
 async def handle_text(event: MessageCreated):
-    user_id = get_user_id(event)
-    if not user_id:
-        await event.reply("❌ Не удалось определить пользователя")
+    chat_id = get_chat_id(event)
+    if not chat_id:
         return
     text = event.message.body.text.strip()
-    state = user_states.get(user_id)
+    state = user_states.get(chat_id)
     if not state:
-        await event.reply("Напиши /start, чтобы начать")
+        await send_message(event, "Напиши /start, чтобы начать")
         return
     if state.get("step") == "azs":
         try:
             azs_id = int(text)
             if not any(azs["id"] == azs_id for azs in AZS_LIST):
-                await event.reply("❌ Такой АЗС нет. Выбери номер из списка.")
+                await send_message(event, "❌ Такой АЗС нет. Выбери номер из списка.")
                 return
             state["azs_id"] = azs_id
             state["step"] = "fuel"
@@ -82,7 +87,7 @@ async def handle_text(event: MessageCreated):
             state["fuel_index"] = 0
             await ask_fuel(event, state)
         except ValueError:
-            await event.reply("❌ Введи номер АЗС из списка (например, 1)")
+            await send_message(event, "❌ Введи номер АЗС из списка (например, 1)")
     elif state.get("step") == "fuel":
         await handle_fuel_status(event, state)
     elif state.get("step") == "remaining":
@@ -98,12 +103,12 @@ async def ask_fuel(event: MessageCreated, state: dict):
     idx = state.get("fuel_index", 0)
     if idx >= len(FUEL_TYPES):
         state["step"] = "queue"
-        await event.reply("🚗 Введи количество машин в очереди (число):")
+        await send_message(event, "🚗 Введи количество машин в очереди (число):")
         return
     fuel = FUEL_TYPES[idx]
     msg = f"📊 Статус для {FUEL_NAMES[fuel]}:\n"
     msg += "Напиши:\n✅ 1 — есть\n❌ 2 — нет\n⛔ 3 — слив\n(или 'пропустить')"
-    await event.reply(msg)
+    await send_message(event, msg)
     state["current_fuel"] = fuel
 
 async def handle_fuel_status(event: MessageCreated, state: dict):
@@ -121,12 +126,12 @@ async def handle_fuel_status(event: MessageCreated, state: dict):
     }
     status = status_map.get(text)
     if not status:
-        await event.reply("❌ Напиши 1 (есть), 2 (нет), 3 (слив) или 'пропустить'")
+        await send_message(event, "❌ Напиши 1 (есть), 2 (нет), 3 (слив) или 'пропустить'")
         return
     state["fuel_status"][fuel] = status
-    await event.reply(f"✅ {FUEL_NAMES[fuel]} = {status}")
+    await send_message(event, f"✅ {FUEL_NAMES[fuel]} = {status}")
     state["step"] = "remaining"
-    await event.reply(f"📊 Введи остаток для {FUEL_NAMES[fuel]} в % (0-100), или 'пропустить':")
+    await send_message(event, f"📊 Введи остаток для {FUEL_NAMES[fuel]} в % (0-100), или 'пропустить':")
 
 async def handle_remaining(event: MessageCreated, state: dict):
     text = event.message.body.text.strip().lower()
@@ -134,19 +139,19 @@ async def handle_remaining(event: MessageCreated, state: dict):
     if not fuel: return
     if text in ["пропустить", "skip", "пропуск"]:
         state["step"] = "price"
-        await event.reply(f"💰 Введи цену для {FUEL_NAMES[fuel]} (например, 52.50), или 'пропустить':")
+        await send_message(event, f"💰 Введи цену для {FUEL_NAMES[fuel]} (например, 52.50), или 'пропустить':")
         return
     try:
         rem = int(text)
         if rem < 0 or rem > 100:
-            await event.reply("❌ Остаток должен быть от 0 до 100%")
+            await send_message(event, "❌ Остаток должен быть от 0 до 100%")
             return
         state["remaining"][fuel] = rem
-        await event.reply(f"✅ Остаток {rem}% сохранён")
+        await send_message(event, f"✅ Остаток {rem}% сохранён")
         state["step"] = "price"
-        await event.reply(f"💰 Введи цену для {FUEL_NAMES[fuel]} (например, 52.50), или 'пропустить':")
+        await send_message(event, f"💰 Введи цену для {FUEL_NAMES[fuel]} (например, 52.50), или 'пропустить':")
     except ValueError:
-        await event.reply("❌ Введи число от 0 до 100")
+        await send_message(event, "❌ Введи число от 0 до 100")
 
 async def handle_price(event: MessageCreated, state: dict):
     text = event.message.body.text.strip().lower()
@@ -160,34 +165,34 @@ async def handle_price(event: MessageCreated, state: dict):
     try:
         price = float(text)
         if price < 0:
-            await event.reply("❌ Цена не может быть отрицательной")
+            await send_message(event, "❌ Цена не может быть отрицательной")
             return
         state["prices"][fuel] = price
-        await event.reply(f"✅ Цена {price} руб сохранена")
+        await send_message(event, f"✅ Цена {price} руб сохранена")
         state["fuel_index"] += 1
         state["step"] = "fuel"
         await ask_fuel(event, state)
     except ValueError:
-        await event.reply("❌ Введи число (например, 52.50)")
+        await send_message(event, "❌ Введи число (например, 52.50)")
 
 async def handle_queue(event: MessageCreated, state: dict):
     try:
         q = int(event.message.body.text.strip())
         if q < 0:
-            await event.reply("❌ Количество машин не может быть отрицательным")
+            await send_message(event, "❌ Количество машин не может быть отрицательным")
             return
         state["queue"] = q
         state["step"] = "photo"
-        await event.reply("📸 Отправь фото заправки (или напиши 'пропустить')")
+        await send_message(event, "📸 Отправь фото заправки (или напиши 'пропустить')")
     except ValueError:
-        await event.reply("❌ Введи число машин в очереди")
+        await send_message(event, "❌ Введи число машин в очереди")
 
 @dp.message_created(F.message.body.photo)
 async def handle_photo(event: MessageCreated):
-    user_id = get_user_id(event)
-    if not user_id:
+    chat_id = get_chat_id(event)
+    if not chat_id:
         return
-    state = user_states.get(user_id)
+    state = user_states.get(chat_id)
     if not state or state.get("step") != "photo":
         return
     try:
@@ -200,16 +205,15 @@ async def handle_photo(event: MessageCreated):
         await send_report(event, state)
     except Exception as e:
         logging.error(f"Ошибка фото: {e}")
-        await event.reply("❌ Не удалось загрузить фото. Попробуй еще раз.")
+        await send_message(event, "❌ Не удалось загрузить фото. Попробуй еще раз.")
 
 async def send_report(event: MessageCreated, state: dict):
-    user_id = get_user_id(event)
-    if not user_id:
-        await event.reply("❌ Не удалось определить пользователя")
+    chat_id = get_chat_id(event)
+    if not chat_id:
         return
     name = "Оператор"
     report = {
-        "max_user_id": user_id,
+        "max_user_id": chat_id,
         "azs_id": state["azs_id"],
         "operator_name": name,
         "fuel_status": state.get("fuel_status", {}),
@@ -225,15 +229,15 @@ async def send_report(event: MessageCreated, state: dict):
         async with aiohttp.ClientSession() as session:
             async with session.post(WEBHOOK_URL, json=report, headers=headers) as resp:
                 if resp.status == 200:
-                    await event.reply("✅ Отчёт принят! Спасибо!")
+                    await send_message(event, "✅ Отчёт принят! Спасибо!")
                 else:
                     error_text = await resp.text()
-                    await event.reply(f"❌ Ошибка: {resp.status}\n{error_text}")
+                    await send_message(event, f"❌ Ошибка: {resp.status}\n{error_text}")
     except Exception as e:
         logging.error(f"Ошибка отправки: {e}")
-        await event.reply("❌ Не удалось отправить отчёт.")
-    if user_id in user_states:
-        del user_states[user_id]
+        await send_message(event, "❌ Не удалось отправить отчёт.")
+    if chat_id in user_states:
+        del user_states[chat_id]
 
 # --- ЗАПУСК ---
 async def main():
