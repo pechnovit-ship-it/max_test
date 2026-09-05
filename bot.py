@@ -76,6 +76,8 @@ async def handle_text(event: MessageCreated):
     if not state:
         await send_message(chat_id, "Напиши /start, чтобы начать")
         return
+    
+    # --- ВЫБОР АЗС ---
     if state.get("step") == "azs":
         try:
             azs_id = int(text)
@@ -91,16 +93,35 @@ async def handle_text(event: MessageCreated):
             await ask_fuel(chat_id, state)
         except ValueError:
             await send_message(chat_id, "❌ Введи номер АЗС из списка (например, 1)")
-    elif state.get("step") == "fuel":
+        return
+    
+    # --- СТАТУС ТОПЛИВА ---
+    if state.get("step") == "fuel":
         await handle_fuel_status(chat_id, state, text)
-    elif state.get("step") == "remaining":
+        return
+    
+    # --- ОСТАТОК ---
+    if state.get("step") == "remaining":
         await handle_remaining(chat_id, state, text)
-    elif state.get("step") == "price":
+        return
+    
+    # --- ЦЕНА ---
+    if state.get("step") == "price":
         await handle_price(chat_id, state, text)
-    elif state.get("step") == "queue":
+        return
+    
+    # --- ОЧЕРЕДЬ ---
+    if state.get("step") == "queue":
         await handle_queue(chat_id, state, text)
-    elif state.get("step") == "photo" and text.lower() in ["пропустить", "skip", "пропуск", "нет"]:
+        return
+    
+    # --- ПРОПУСК ФОТО ---
+    if state.get("step") == "photo" and text.lower() in ["пропустить", "skip", "пропуск", "нет"]:
         await send_report(chat_id, state)
+        return
+    
+    # Если ничего не подошло
+    await send_message(chat_id, "❌ Я не понял. Напиши номер или 'пропустить'.")
 
 async def ask_fuel(chat_id: str, state: dict):
     idx = state.get("fuel_index", 0)
@@ -117,7 +138,8 @@ async def ask_fuel(chat_id: str, state: dict):
 async def handle_fuel_status(chat_id: str, state: dict, text: str):
     text = text.strip().lower()
     fuel = state.get("current_fuel")
-    if not fuel: return
+    if not fuel: 
+        return
     if text in ["пропустить", "skip", "пропуск"]:
         state["fuel_index"] += 1
         await ask_fuel(chat_id, state)
@@ -139,7 +161,8 @@ async def handle_fuel_status(chat_id: str, state: dict, text: str):
 async def handle_remaining(chat_id: str, state: dict, text: str):
     text = text.strip().lower()
     fuel = state.get("current_fuel")
-    if not fuel: return
+    if not fuel: 
+        return
     if text in ["пропустить", "skip", "пропуск"]:
         state["step"] = "price"
         await send_message(chat_id, f"💰 Введи цену для {FUEL_NAMES[fuel]} (например, 52.50), или 'пропустить':")
@@ -159,7 +182,8 @@ async def handle_remaining(chat_id: str, state: dict, text: str):
 async def handle_price(chat_id: str, state: dict, text: str):
     text = text.strip().lower()
     fuel = state.get("current_fuel")
-    if not fuel: return
+    if not fuel: 
+        return
     if text in ["пропустить", "skip", "пропуск"]:
         state["fuel_index"] += 1
         state["step"] = "fuel"
