@@ -30,20 +30,31 @@ AZS_LIST = [
 user_states = {}
 
 def get_chat_id(event):
-    """Получить chat_id из события"""
+    """Получить chat_id из события (из любого места)"""
+    # Прямой доступ к атрибуту
     if hasattr(event, 'chat_id'):
         return str(event.chat_id)
+    # Через message
     if hasattr(event, 'message') and hasattr(event.message, 'chat_id'):
         return str(event.message.chat_id)
+    # Через sender
+    if hasattr(event, 'sender') and hasattr(event.sender, 'id'):
+        return str(event.sender.id)
+    # Через user_id (как в логах)
+    if hasattr(event, 'user_id'):
+        return str(event.user_id)
+    # Если ничего не найдено, логируем структуру
+    logging.error(f"Не удалось найти chat_id в event: {dir(event)}")
     return None
 
 async def send_message(event, text):
-    """Универсальная отправка сообщения"""
+    """Отправка сообщения через bot.send_message"""
     chat_id = get_chat_id(event)
     if chat_id:
         await bot.send_message(chat_id, text)
+        logging.info(f"Отправлено сообщение в chat_id={chat_id}: {text[:50]}...")
     else:
-        logging.error("Не удалось определить chat_id")
+        logging.error("Не удалось определить chat_id для отправки")
 
 # --- ОБРАБОТЧИКИ ---
 @dp.bot_started()
