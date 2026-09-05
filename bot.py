@@ -40,8 +40,6 @@ def get_chat_id(event):
         return event.message.chat_id
     if hasattr(event, 'chat') and hasattr(event.chat, 'id'):
         return event.chat.id
-    if hasattr(event, 'sender') and hasattr(event.sender, 'id'):
-        return event.sender.id
     return None
 
 async def send_message(chat_id, text, keyboard=None):
