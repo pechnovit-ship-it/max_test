@@ -1,283 +1,136 @@
-import asyncio
+import os
+import time
+import json
 import logging
-import aiohttp
-import base64
-from maxapi import Bot, Dispatcher, F
-from maxapi.filters.command import CommandStart
-from maxapi.types import BotStarted, MessageCreated
+from collections import deque
 
-# --- КОНФИГ ---
-MAX_BOT_TOKEN = "f9LHodD0cOIv3pssaR8kV9WyEVMdYmHoyXHjxLnQtCSRcENWj-6f9ZhyxsQC6qK8F7qOSqpCgIwTkRN8q9NM"
-BOT_SECRET = "F7kL9mN2pQ5rS8tU1vW3xY4zA6bC0dE9"
-APP_URL = "https://data-reporting-via-a-bot.pechnovit.workers.dev"
-WEBHOOK_URL = f"{APP_URL}/api/public/bot/report"
+import requests
 
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=MAX_BOT_TOKEN)
-dp = Dispatcher()
+log = logging.getLogger("max-bot")
 
-# --- ДАННЫЕ ---
-FUEL_TYPES = ["92", "95", "98", "100", "dt", "gas"]
-FUEL_NAMES = {
-    "92": "АИ-92", "95": "АИ-95", "98": "АИ-98",
-    "100": "АИ-100", "dt": "ДТ", "gas": "ГАЗ"
-}
-AZS_LIST = [
-    {"id": 1, "name": "Лукойл №13202", "address": "ул. Волгоградская, 48"},
-    {"id": 2, "name": "Татнефть №16", "address": "ул. Лодыгина, 17Б"},
-    {"id": 3, "name": "Башнефть Косарева", "address": "ул. Косарева, 128а"},
-]
-user_states = {}
+# ===== КОНФИГ =====
+API = "https://platform-api.max.ru"
+TOKEN = "f9LHodD0cOIv3pssaR8kV9WyEVMdYmHoyXHjxLnQtCSRcENWj-6f9ZhyxsQC6qK8F7qOSqpCgIwTkRN8q9NM"
+HEADERS = {"Authorization": TOKEN, "Content-Type": "application/json"}
 
-def get_chat_id(event):
-    if hasattr(event, 'chat_id'):
-        return event.chat_id
-    if hasattr(event, 'message') and hasattr(event.message, 'chat'):
-        return event.message.chat.id
-    if hasattr(event, 'message') and hasattr(event.message, 'chat_id'):
-        return event.message.chat_id
-    if hasattr(event, 'chat') and hasattr(event.chat, 'id'):
-        return event.chat.id
-    return None
+# Защита от повторной обработки
+_SEEN = deque(maxlen=200)
 
-async def send_message(chat_id, text):
+# ===== ФУНКЦИИ ОТПРАВКИ =====
+def send_message(chat_id: int, text: str, keyboard=None):
+    url = f"{API}/messages"
+    payload = {"chat_id": chat_id, "text": text}
+    if keyboard:
+        payload["inline_keyboard"] = keyboard
     try:
-        await bot.send_message(chat_id=chat_id, text=text)
-        logging.info(f"✅ Отправлено: {text[:50]}...")
-        return True
+        resp = requests.post(url, headers=HEADERS, json=payload, timeout=10)
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", 5))
+            log.warning(f"429, ждём {wait} сек")
+            time.sleep(wait)
+            return send_message(chat_id, text, keyboard)
+        if resp.ok:
+            log.info(f"✅ Отправлено: {text[:50]}...")
+        else:
+            log.error(f"❌ Ошибка: {resp.status_code} {resp.text[:200]}")
     except Exception as e:
-        logging.error(f"❌ Ошибка отправки: {e}")
-        return False
+        log.error(f"❌ Ошибка отправки: {e}")
 
-async def send_report_to_app(chat_id, state):
-    report = {
-        "max_user_id": str(chat_id),
-        "azs_id": state["azs_id"],
-        "operator_name": "Оператор",
-        "fuel_status": state.get("fuel_status", {}),
-        "queue_length": state.get("queue", 0),
-        "prices": state.get("prices", {}),
-        "remaining": state.get("remaining", {}),
-        "note": state.get("note", ""),
-    }
-    if "photo_base64" in state:
-        report["photo_base64"] = state["photo_base64"]
-    
-    headers = {"x-bot-secret": BOT_SECRET}
+def answer_callback(callback_id: str, notification: str = "Готово"):
+    if not callback_id:
+        return
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(WEBHOOK_URL, json=report, headers=headers) as resp:
-                if resp.status == 200:
-                    await send_message(chat_id, "✅ Отчёт принят! Спасибо!")
-                else:
-                    error_text = await resp.text()
-                    await send_message(chat_id, f"❌ Ошибка: {resp.status}\n{error_text}")
-        return True
+        resp = requests.post(
+            f"{API}/answers",
+            headers=HEADERS,
+            params={"callback_id": callback_id},
+            json={"notification": notification},
+            timeout=10,
+        )
+        if not resp.ok:
+            log.error(f"❌ Ошибка callback: {resp.status_code}")
     except Exception as e:
-        logging.error(f"Ошибка отправки: {e}")
-        await send_message(chat_id, "❌ Не удалось отправить отчёт.")
-        return False
+        log.error(f"❌ Ошибка callback: {e}")
 
-# --- ОБРАБОТЧИКИ ---
-@dp.bot_started()
-async def start(event: BotStarted):
-    chat_id = get_chat_id(event)
-    if chat_id:
-        await send_message(chat_id, "👋 Привет! Напиши /start")
+# ===== ОБРАБОТКА СОБЫТИЙ =====
+def handle_update(update):
+    ut = update.get("update_type")
+    
+    # ---- НОВОЕ СООБЩЕНИЕ ----
+    if ut == "message_created":
+        msg = update.get("message", {})
+        recipient = msg.get("recipient", {})
+        chat_id = recipient.get("chat_id")
+        body = msg.get("body", {})
+        text = (body.get("text") or "").strip()
+        
+        if chat_id is None:
+            return
+        
+        # Команда /start
+        if text.startswith("/start"):
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "Лукойл №13202", "callback_data": "azs_1"}],
+                    [{"text": "Татнефть №16", "callback_data": "azs_2"}],
+                    [{"text": "Башнефть Косарева", "callback_data": "azs_3"}]
+                ]
+            }
+            send_message(chat_id, "⛽ Выберите АЗС:", keyboard)
+        
+        # Команда /help
+        elif text == "/help":
+            send_message(chat_id, "Доступно:\n/start - начать\n/help - помощь")
+        
+        # Любой другой текст
+        else:
+            send_message(chat_id, f"Вы написали: {text}")
+    
+    # ---- НАЖАТИЕ КНОПКИ ----
+    elif ut == "message_callback":
+        cb = update.get("callback", {})
+        callback_id = cb.get("callback_id")
+        payload = cb.get("payload", "")
+        msg = cb.get("message", {})
+        recipient = msg.get("recipient", {})
+        chat_id = recipient.get("chat_id")
+        
+        answer_callback(callback_id, "Принято")
+        
+        if chat_id is not None:
+            send_message(chat_id, f"Вы выбрали: {payload}")
+            # Здесь можно добавить логику опроса по топливу
+    
+    # ---- БОТА ДОБАВИЛИ В ЧАТ ----
+    elif ut == "bot_added":
+        log.info(f"Бот добавлен в чат: {update.get('chat_id')}")
 
-@dp.message_created(CommandStart())
-async def cmd_start(event: MessageCreated):
-    chat_id = get_chat_id(event)
-    if not chat_id:
-        logging.error("Не удалось определить chat_id")
-        return
-    
-    if chat_id in user_states:
-        del user_states[chat_id]
-    
-    user_states[chat_id] = {"step": "azs"}
-    msg = "⛽ Выбери АЗС, написав её номер:\n\n"
-    for azs in AZS_LIST:
-        msg += f"{azs['id']} — {azs['name']} ({azs['address']})\n"
-    msg += "\nНапример, напиши 1"
-    await send_message(chat_id, msg)
+# ===== ПОЛЛИНГ =====
+def poll_updates(marker=None, timeout=30):
+    params = {"timeout": timeout, "limit": 100}
+    if marker:
+        params["marker"] = marker
+    resp = requests.get(f"{API}/updates", headers=HEADERS, params=params, timeout=timeout + 10)
+    resp.raise_for_status()
+    return resp.json()
 
-@dp.message_created(F.message.body.text)
-async def handle_text(event: MessageCreated):
-    chat_id = get_chat_id(event)
-    if not chat_id:
-        return
-    
-    text = event.message.body.text.strip()
-    state = user_states.get(chat_id)
-    
-    if not state:
-        await send_message(chat_id, "Напиши /start, чтобы начать")
-        return
-    
-    if state.get("step") == "azs":
+def main():
+    marker = None
+    log.info("🚀 Бот запущен (long polling)")
+    while True:
         try:
-            azs_id = int(text)
-            if not any(azs["id"] == azs_id for azs in AZS_LIST):
-                await send_message(chat_id, "❌ Такой АЗС нет. Выбери номер из списка.")
-                return
-            state["azs_id"] = azs_id
-            state["step"] = "fuel"
-            state["fuel_status"] = {}
-            state["prices"] = {}
-            state["remaining"] = {}
-            state["fuel_index"] = 0
-            await ask_fuel(chat_id, state)
-        except ValueError:
-            await send_message(chat_id, "❌ Введи номер АЗС из списка (например, 1)")
-        return
-    
-    if state.get("step") == "fuel":
-        await handle_fuel_status(chat_id, state, text)
-        return
-    
-    if state.get("step") == "remaining":
-        await handle_remaining(chat_id, state, text)
-        return
-    
-    if state.get("step") == "price":
-        await handle_price(chat_id, state, text)
-        return
-    
-    if state.get("step") == "queue":
-        await handle_queue(chat_id, state, text)
-        return
-    
-    if state.get("step") == "photo" and text.lower() in ["пропустить", "skip", "пропуск", "нет"]:
-        await send_report_to_app(chat_id, state)
-        del user_states[chat_id]
-        return
-    
-    await send_message(chat_id, "❌ Я не понял. Напиши номер или 'пропустить'.")
-
-async def ask_fuel(chat_id, state):
-    idx = state.get("fuel_index", 0)
-    if idx >= len(FUEL_TYPES):
-        state["step"] = "queue"
-        await send_message(chat_id, "🚗 Введи количество машин в очереди (число):")
-        return
-    
-    fuel = FUEL_TYPES[idx]
-    msg = f"📊 Статус для {FUEL_NAMES[fuel]}:\n"
-    msg += "Напиши:\n1 — есть\n2 — нет\n3 — слив\n(или 'пропустить')"
-    await send_message(chat_id, msg)
-    state["current_fuel"] = fuel
-
-async def handle_fuel_status(chat_id, state, text):
-    text = text.strip().lower()
-    fuel = state.get("current_fuel")
-    if not fuel:
-        return
-    
-    if text in ["пропустить", "skip", "пропуск"]:
-        state["fuel_index"] += 1
-        await ask_fuel(chat_id, state)
-        return
-    
-    status_map = {
-        "1": "available", "2": "unavailable", "3": "refueling",
-        "есть": "available", "нет": "unavailable", "слив": "refueling"
-    }
-    status = status_map.get(text)
-    if not status:
-        await send_message(chat_id, "❌ Напиши 1 (есть), 2 (нет) или 3 (слив)")
-        return
-    
-    state["fuel_status"][fuel] = status
-    await send_message(chat_id, f"✅ {FUEL_NAMES[fuel]} = {status}")
-    state["step"] = "remaining"
-    await send_message(chat_id, f"📊 Введи остаток для {FUEL_NAMES[fuel]} в % (0-100), или 'пропустить':")
-
-async def handle_remaining(chat_id, state, text):
-    text = text.strip().lower()
-    fuel = state.get("current_fuel")
-    if not fuel:
-        return
-    
-    if text in ["пропустить", "skip", "пропуск"]:
-        state["step"] = "price"
-        await send_message(chat_id, f"💰 Введи цену для {FUEL_NAMES[fuel]} (например, 52.50), или 'пропустить':")
-        return
-    
-    try:
-        rem = int(text)
-        if rem < 0 or rem > 100:
-            await send_message(chat_id, "❌ Остаток должен быть от 0 до 100%")
-            return
-        state["remaining"][fuel] = rem
-        await send_message(chat_id, f"✅ Остаток {rem}% сохранён")
-        state["step"] = "price"
-        await send_message(chat_id, f"💰 Введи цену для {FUEL_NAMES[fuel]} (например, 52.50), или 'пропустить':")
-    except ValueError:
-        await send_message(chat_id, "❌ Введи число от 0 до 100")
-
-async def handle_price(chat_id, state, text):
-    text = text.strip().lower()
-    fuel = state.get("current_fuel")
-    if not fuel:
-        return
-    
-    if text in ["пропустить", "skip", "пропуск"]:
-        state["fuel_index"] += 1
-        state["step"] = "fuel"
-        await ask_fuel(chat_id, state)
-        return
-    
-    try:
-        price = float(text)
-        if price < 0:
-            await send_message(chat_id, "❌ Цена не может быть отрицательной")
-            return
-        state["prices"][fuel] = price
-        await send_message(chat_id, f"✅ Цена {price} руб сохранена")
-        state["fuel_index"] += 1
-        state["step"] = "fuel"
-        await ask_fuel(chat_id, state)
-    except ValueError:
-        await send_message(chat_id, "❌ Введи число (например, 52.50)")
-
-async def handle_queue(chat_id, state, text):
-    try:
-        q = int(text.strip())
-        if q < 0:
-            await send_message(chat_id, "❌ Количество машин не может быть отрицательным")
-            return
-        state["queue"] = q
-        state["step"] = "photo"
-        await send_message(chat_id, "📸 Отправь фото заправки (или напиши 'пропустить')")
-    except ValueError:
-        await send_message(chat_id, "❌ Введи число машин в очереди")
-
-@dp.message_created(F.message.body.photo)
-async def handle_photo(event: MessageCreated):
-    chat_id = get_chat_id(event)
-    if not chat_id:
-        return
-    
-    state = user_states.get(chat_id)
-    if not state or state.get("step") != "photo":
-        return
-    
-    try:
-        photo = event.message.body.photo
-        file = await bot.get_file(photo.file_id)
-        content = await bot.download_file(file.file_path)
-        b64 = base64.b64encode(content).decode('utf-8')
-        state["photo_base64"] = f"data:image/jpeg;base64,{b64}"
-        await send_report_to_app(chat_id, state)
-        if chat_id in user_states:
-            del user_states[chat_id]
-    except Exception as e:
-        logging.error(f"Ошибка фото: {e}")
-        await send_message(chat_id, "❌ Не удалось загрузить фото. Попробуй еще раз.")
-
-async def main():
-    await dp.start_polling(bot)
+            data = poll_updates(marker)
+            for update in data.get("updates", []):
+                handle_update(update)
+            if data.get("marker"):
+                marker = data["marker"]
+        except requests.RequestException as e:
+            log.warning(f"Сеть/API: {e} — пауза 5 сек")
+            time.sleep(5)
+        except Exception as e:
+            log.error(f"Ошибка: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
