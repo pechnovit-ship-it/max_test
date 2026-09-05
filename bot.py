@@ -8,7 +8,7 @@ from maxapi.filters.command import CommandStart
 from maxapi.types import BotStarted, MessageCreated
 
 # --- КОНФИГ ---
-MAX_BOT_TOKEN = "ТВОЙ_ТОКЕН_БОТА"
+MAX_BOT_TOKEN = "f9LHodD0cOIv3pssaR8kV9WyEVMdYmHoyXHjxLnQtCSRcENWj-6f9ZhyxsQC6qK8F7qOSqpCgIwTkRN8q9NM"
 BOT_SECRET = "F7kL9mN2pQ5rS8tU1vW3xY4zA6bC0dE9"
 APP_URL = "https://data-reporting-via-a-bot.pechnovit.workers.dev"
 WEBHOOK_URL = f"{APP_URL}/api/public/bot/report"
