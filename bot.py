@@ -59,6 +59,9 @@ async def cmd_start(event: MessageCreated):
     chat_id = get_chat_id(event)
     if not chat_id:
         return
+    # Очищаем состояние пользователя, если оно есть
+    if chat_id in user_states:
+        del user_states[chat_id]
     user_states[chat_id] = {"step": "azs"}
     msg = "⛽ Выбери АЗС, написав её номер:\n\n"
     for azs in AZS_LIST:
@@ -72,6 +75,12 @@ async def handle_text(event: MessageCreated):
     if not chat_id:
         return
     text = event.message.body.text.strip()
+    
+    # Если пользователь написал /start в любом виде — перезапускаем процесс
+    if text.startswith('/start'):
+        await cmd_start(event)
+        return
+    
     state = user_states.get(chat_id)
     if not state:
         await send_message(chat_id, "Напиши /start, чтобы начать")
