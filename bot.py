@@ -34,9 +34,12 @@ def poll_updates(marker=None, timeout=30):
     r.raise_for_status()
     return r.json()
 
-def send_message_safe(chat_id: int, text: str, retries: int = 3) -> None:
+def send_message_safe(chat_id, text, retries: int = 3) -> None:
+    """Отправка сообщения с chat_id как строка"""
     url = f"{API}/messages"
-    body = {"chat_id": chat_id, "text": text}
+    # chat_id должен быть строкой
+    body = {"chat_id": str(chat_id), "text": text}
+    
     for attempt in range(retries):
         resp = requests.post(url, headers=HEADERS, json=body, timeout=20)
         if resp.status_code == 429:
@@ -47,6 +50,7 @@ def send_message_safe(chat_id: int, text: str, retries: int = 3) -> None:
         if not resp.ok:
             log.error("messages: %s %s", resp.status_code, resp.text[:400])
         else:
+            log.info(f"✅ Отправлено: {text[:50]}...")
             break
 
 def answer_callback(callback_id: str, notification: str = "Готово") -> None:
@@ -79,17 +83,19 @@ def handle_update(update: dict) -> None:
         if chat_id is None:
             return
 
+        log.info(f"Сообщение от chat_id: {chat_id} (тип: {type(chat_id)})")
+
         if text.startswith("/start"):
             parts = text.split(maxsplit=1)
             payload = parts[1] if len(parts) > 1 else ""
             if payload:
-                send_message_safe(int(chat_id), f"Старт с параметром: {payload}")
+                send_message_safe(chat_id, f"Старт с параметром: {payload}")
             else:
-                send_message_safe(int(chat_id), "Привет! Напишите /help.")
+                send_message_safe(chat_id, "Привет! Напишите /help.")
         elif text == "/help":
-            send_message_safe(int(chat_id), "Доступно:\n/start [код]\n/help")
+            send_message_safe(chat_id, "Доступно:\n/start [код]\n/help")
         else:
-            send_message_safe(int(chat_id), f"Вы написали: {text}")
+            send_message_safe(chat_id, f"Вы написали: {text}")
 
     elif ut == "message_callback":
         cb = update.get("callback") or {}
@@ -101,7 +107,7 @@ def handle_update(update: dict) -> None:
 
         answer_callback(callback_id, "Принято")
         if chat_id is not None:
-            send_message_safe(int(chat_id), f"Нажата кнопка, payload: {payload}")
+            send_message_safe(chat_id, f"Нажата кнопка, payload: {payload}")
 
     elif ut == "bot_added":
         log.info("Бот добавлен в чат: %s", update.get("chat_id"))
