@@ -2,7 +2,6 @@ import os
 import time
 import logging
 from collections import deque
-
 import requests
 
 logging.basicConfig(level=logging.INFO)
@@ -35,13 +34,21 @@ def poll_updates(marker=None, timeout=30):
     return r.json()
 
 def send_message_safe(chat_id, text, retries: int = 3) -> None:
-    """Отправка сообщения с chat_id как строка"""
+    """Отправка сообщения по правильной структуре MAX"""
     url = f"{API}/messages"
-    # chat_id должен быть строкой
-    body = {"chat_id": str(chat_id), "text": text}
+    
+    # ПРАВИЛЬНАЯ структура для MAX
+    payload = {
+        "recipient": {
+            "chat_id": str(chat_id)
+        },
+        "message": {
+            "text": text
+        }
+    }
     
     for attempt in range(retries):
-        resp = requests.post(url, headers=HEADERS, json=body, timeout=20)
+        resp = requests.post(url, headers=HEADERS, json=payload, timeout=20)
         if resp.status_code == 429:
             wait = int(resp.headers.get("Retry-After", 5))
             log.warning("429 messages, ждём %s с (попытка %s)", wait, attempt + 1)
@@ -91,7 +98,7 @@ def handle_update(update: dict) -> None:
             if payload:
                 send_message_safe(chat_id, f"Старт с параметром: {payload}")
             else:
-                send_message_safe(chat_id, "Привет! Напишите /help.")
+                send_message_safe(chat_id, "Привет! Напиши /help.")
         elif text == "/help":
             send_message_safe(chat_id, "Доступно:\n/start [код]\n/help")
         else:
