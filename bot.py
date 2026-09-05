@@ -29,53 +29,49 @@ AZS_LIST = [
 ]
 user_states = {}
 
-MY_CHAT_ID = "512925955"
-
-async def send_message(text):
-    """Отправка сообщения через bot.send_message с правильным форматом"""
-    try:
-        # Пробуем отправить как обычный текст
-        await bot.send_message(chat_id=MY_CHAT_ID, text=text)
-        logging.info(f"✅ Отправлено (text): {text[:50]}...")
-        return
-    except Exception as e1:
-        logging.warning(f"Попытка 1 (text) не удалась: {e1}")
-    
-    try:
-        # Пробуем через content
-        await bot.send_message(chat_id=MY_CHAT_ID, content=text)
-        logging.info(f"✅ Отправлено (content): {text[:50]}...")
-        return
-    except Exception as e2:
-        logging.warning(f"Попытка 2 (content) не удалась: {e2}")
-    
-    try:
-        # Пробуем через message
-        await bot.send_message(chat_id=MY_CHAT_ID, message=text)
-        logging.info(f"✅ Отправлено (message): {text[:50]}...")
-        return
-    except Exception as e3:
-        logging.warning(f"Попытка 3 (message) не удалась: {e3}")
-    
-    try:
-        # Пробуем через body
-        await bot.send_message(chat_id=MY_CHAT_ID, body=text)
-        logging.info(f"✅ Отправлено (body): {text[:50]}...")
-        return
-    except Exception as e4:
-        logging.warning(f"Попытка 4 (body) не удалась: {e4}")
-    
-    # Если ничего не сработало
-    logging.error("❌ Все способы отправки не удались")
-
 # --- ОБРАБОТЧИКИ ---
 @dp.bot_started()
 async def start(event: BotStarted):
-    await send_message("👋 Привет! Напиши /start")
+    # Пробуем отправить через send (если есть)
+    try:
+        await event.send("👋 Привет! Напиши /start")
+        return
+    except:
+        pass
+    # Пробуем через message.reply
+    try:
+        await event.message.reply("👋 Привет! Напиши /start")
+        return
+    except:
+        pass
+    # Пробуем через chat.send
+    try:
+        await event.chat.send("👋 Привет! Напиши /start")
+        return
+    except:
+        pass
+    # Если ничего не работает, логируем структуру event
+    logging.error(f"Не удалось отправить сообщение. Структура event: {dir(event)}")
 
 @dp.message_created(CommandStart())
 async def cmd_start(event: MessageCreated):
-    await send_message("⛽ Привет! Я бот для сбора отчетов. Я работаю!")
+    # Аналогично пробуем все варианты
+    try:
+        await event.send("⛽ Выбери АЗС, написав её номер:\n\n1 — Лукойл №13202\n2 — Татнефть №16\n3 — Башнефть Косарева\n\nНапример, напиши 1")
+        return
+    except:
+        pass
+    try:
+        await event.message.reply("⛽ Выбери АЗС, написав её номер:\n\n1 — Лукойл №13202\n2 — Татнефть №16\n3 — Башнефть Косарева\n\nНапример, напиши 1")
+        return
+    except:
+        pass
+    try:
+        await event.chat.send("⛽ Выбери АЗС, написав её номер:\n\n1 — Лукойл №13202\n2 — Татнефть №16\n3 — Башнефть Косарева\n\nНапример, напиши 1")
+        return
+    except:
+        pass
+    logging.error(f"Не удалось отправить сообщение. Структура event: {dir(event)}")
 
 # --- ЗАПУСК ---
 async def main():
