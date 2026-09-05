@@ -115,7 +115,6 @@ async def handle_text(event: MessageCreated):
         await send_message(chat_id, "Напиши /start, чтобы начать")
         return
     
-    # --- ВЫБОР АЗС ---
     if state.get("step") == "azs":
         try:
             azs_id = int(text)
@@ -133,27 +132,22 @@ async def handle_text(event: MessageCreated):
             await send_message(chat_id, "❌ Введи номер АЗС из списка (например, 1)")
         return
     
-    # --- СТАТУС ТОПЛИВА ---
     if state.get("step") == "fuel":
         await handle_fuel_status(chat_id, state, text)
         return
     
-    # --- ОСТАТОК ---
     if state.get("step") == "remaining":
         await handle_remaining(chat_id, state, text)
         return
     
-    # --- ЦЕНА ---
     if state.get("step") == "price":
         await handle_price(chat_id, state, text)
         return
     
-    # --- ОЧЕРЕДЬ ---
     if state.get("step") == "queue":
         await handle_queue(chat_id, state, text)
         return
     
-    # --- ПРОПУСК ФОТО ---
     if state.get("step") == "photo" and text.lower() in ["пропустить", "skip", "пропуск", "нет"]:
         await send_report_to_app(chat_id, state)
         del user_states[chat_id]
