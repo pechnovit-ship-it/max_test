@@ -29,9 +29,7 @@ AZS_LIST = [
 ]
 user_states = {}
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_chat_id(event):
-    """Получить chat_id из события"""
     if hasattr(event, 'chat_id'):
         return event.chat_id
     if hasattr(event, 'message') and hasattr(event.message, 'chat'):
@@ -42,13 +40,9 @@ def get_chat_id(event):
         return event.chat.id
     return None
 
-async def send_message(chat_id, text, keyboard=None):
-    """Отправка сообщения с поддержкой клавиатуры"""
+async def send_message(chat_id, text):
     try:
-        if keyboard:
-            await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
-        else:
-            await bot.send_message(chat_id=chat_id, text=text)
+        await bot.send_message(chat_id=chat_id, text=text)
         logging.info(f"✅ Отправлено: {text[:50]}...")
         return True
     except Exception as e:
@@ -56,7 +50,6 @@ async def send_message(chat_id, text, keyboard=None):
         return False
 
 async def send_report_to_app(chat_id, state):
-    """Отправка отчёта в приложение"""
     report = {
         "max_user_id": str(chat_id),
         "azs_id": state["azs_id"],
@@ -85,12 +78,12 @@ async def send_report_to_app(chat_id, state):
         await send_message(chat_id, "❌ Не удалось отправить отчёт.")
         return False
 
-# --- ОСНОВНЫЕ ОБРАБОТЧИКИ ---
+# --- ОБРАБОТЧИКИ ---
 @dp.bot_started()
 async def start(event: BotStarted):
     chat_id = get_chat_id(event)
     if chat_id:
-        await send_message(chat_id, "👋 Привет! Я бот для сбора отчётов с АЗС.\nНапиши /start")
+        await send_message(chat_id, "👋 Привет! Напиши /start")
 
 @dp.message_created(CommandStart())
 async def cmd_start(event: MessageCreated):
@@ -99,252 +92,173 @@ async def cmd_start(event: MessageCreated):
         logging.error("Не удалось определить chat_id")
         return
     
-    # Сбрасываем состояние
     if chat_id in user_states:
         del user_states[chat_id]
     
     user_states[chat_id] = {"step": "azs"}
-    
-    # Клавиатура с АЗС
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": f"{azs['name']}", "callback_data": f"azs_{azs['id']}"}]
-            for azs in AZS_LIST
-        ]
-    }
-    await send_message(
-        chat_id,
-        "⛽ Выберите АЗС для отчёта:",
-        keyboard
-    )
+    msg = "⛽ Выбери АЗС, написав её номер:\n\n"
+    for azs in AZS_LIST:
+        msg += f"{azs['id']} — {azs['name']} ({azs['address']})\n"
+    msg += "\nНапример, напиши 1"
+    await send_message(chat_id, msg)
 
-# --- ВЫБОР АЗС (callback) ---
-@dp.callback_query()
-async def handle_callback(event):
-    chat_id = get_chat_id(event)
-    if not chat_id:
-        return
-    
-    data = event.data
-    if data.startswith("azs_"):
-        azs_id = int(data.split("_")[1])
-        state = user_states.get(chat_id)
-        if not state:
-            await send_message(chat_id, "❌ Ошибка. Начните с /start")
-            return
-        
-        state["azs_id"] = azs_id
-        state["step"] = "fuel"
-        state["fuel_status"] = {}
-        state["prices"] = {}
-        state["remaining"] = {}
-        state["fuel_index"] = 0
-        
-        # Начинаем опрос по топливу
-        await ask_fuel(chat_id, state)
-        await bot.answer_callback_query(event.id, "АЗС выбрана ✅")
-
-# --- ОПРОС ПО ТОПЛИВУ ---
-async def ask_fuel(chat_id, state):
-    idx = state.get("fuel_index", 0)
-    if idx >= len(FUEL_TYPES):
-        state["step"] = "queue"
-        await send_message(chat_id, "🚗 Введите количество машин в очереди (число):")
-        return
-    
-    fuel = FUEL_TYPES[idx]
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ Есть", "callback_data": f"fuel_{fuel}_available"},
-                {"text": "❌ Нет", "callback_data": f"fuel_{fuel}_unavailable"},
-                {"text": "⛔ Слив", "callback_data": f"fuel_{fuel}_refueling"}
-            ],
-            [
-                {"text": "⏭️ Пропустить", "callback_data": f"fuel_{fuel}_skip"}
-            ]
-        ]
-    }
-    await send_message(
-        chat_id,
-        f"📊 Статус для {FUEL_NAMES[fuel]}:",
-        keyboard
-    )
-    state["current_fuel"] = fuel
-
-# --- ОБРАБОТКА СТАТУСА ТОПЛИВА (callback) ---
-@dp.callback_query()
-async def handle_fuel_callback(event):
-    chat_id = get_chat_id(event)
-    if not chat_id:
-        return
-    
-    data = event.data
-    if not data.startswith("fuel_"):
-        return
-    
-    parts = data.split("_")
-    fuel = parts[1]
-    action = parts[2] if len(parts) > 2 else None
-    
-    state = user_states.get(chat_id)
-    if not state:
-        await send_message(chat_id, "❌ Ошибка. Начните с /start")
-        return
-    
-    if action == "skip":
-        state["fuel_index"] += 1
-        await ask_fuel(chat_id, state)
-        await bot.answer_callback_query(event.id, "Пропущено ⏭️")
-        return
-    
-    # Сохраняем статус
-    state["fuel_status"][fuel] = action
-    await send_message(chat_id, f"✅ {FUEL_NAMES[fuel]} = {action}")
-    
-    # Спрашиваем остаток и цену
-    state["step"] = "remaining"
-    state["current_fuel"] = fuel
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "📊 Указать остаток", "callback_data": f"remaining_{fuel}"},
-                {"text": "💰 Указать цену", "callback_data": f"price_{fuel}"}
-            ],
-            [
-                {"text": "⏭️ Пропустить оба", "callback_data": f"skip_extra_{fuel}"}
-            ]
-        ]
-    }
-    await send_message(
-        chat_id,
-        f"📊 Хотите добавить остаток или цену для {FUEL_NAMES[fuel]}?",
-        keyboard
-    )
-    await bot.answer_callback_query(event.id, f"{FUEL_NAMES[fuel]} = {action}")
-
-# --- ОСТАТОК (callback) ---
-@dp.callback_query()
-async def handle_remaining_callback(event):
-    chat_id = get_chat_id(event)
-    if not chat_id:
-        return
-    
-    data = event.data
-    if data.startswith("remaining_"):
-        fuel = data.split("_")[1]
-        state = user_states.get(chat_id)
-        if not state:
-            return
-        state["step"] = "remaining_input"
-        state["current_fuel"] = fuel
-        await send_message(chat_id, f"📊 Введите остаток для {FUEL_NAMES[fuel]} в % (0-100):")
-        await bot.answer_callback_query(event.id, "Введите число")
-
-# --- ЦЕНА (callback) ---
-@dp.callback_query()
-async def handle_price_callback(event):
-    chat_id = get_chat_id(event)
-    if not chat_id:
-        return
-    
-    data = event.data
-    if data.startswith("price_"):
-        fuel = data.split("_")[1]
-        state = user_states.get(chat_id)
-        if not state:
-            return
-        state["step"] = "price_input"
-        state["current_fuel"] = fuel
-        await send_message(chat_id, f"💰 Введите цену для {FUEL_NAMES[fuel]} (например, 52.50):")
-        await bot.answer_callback_query(event.id, "Введите число")
-
-# --- ПРОПУСК ОСТАТКА/ЦЕНЫ ---
-@dp.callback_query()
-async def handle_skip_extra(event):
-    chat_id = get_chat_id(event)
-    if not chat_id:
-        return
-    
-    data = event.data
-    if data.startswith("skip_extra_"):
-        state = user_states.get(chat_id)
-        if not state:
-            return
-        state["fuel_index"] += 1
-        state["step"] = "fuel"
-        await ask_fuel(chat_id, state)
-        await bot.answer_callback_query(event.id, "Пропущено ⏭️")
-
-# --- ОБРАБОТКА ТЕКСТОВЫХ ВВОДОВ (остаток, цена, очередь) ---
 @dp.message_created(F.message.body.text)
-async def handle_text_input(event: MessageCreated):
+async def handle_text(event: MessageCreated):
     chat_id = get_chat_id(event)
     if not chat_id:
         return
     
     text = event.message.body.text.strip()
     state = user_states.get(chat_id)
+    
     if not state:
-        await send_message(chat_id, "Напишите /start, чтобы начать")
+        await send_message(chat_id, "Напиши /start, чтобы начать")
         return
     
-    # --- ОСТАТОК (текстовый ввод) ---
-    if state.get("step") == "remaining_input":
-        fuel = state.get("current_fuel")
+    # --- ВЫБОР АЗС ---
+    if state.get("step") == "azs":
         try:
-            rem = int(text)
-            if rem < 0 or rem > 100:
-                await send_message(chat_id, "❌ Остаток должен быть от 0 до 100%")
+            azs_id = int(text)
+            if not any(azs["id"] == azs_id for azs in AZS_LIST):
+                await send_message(chat_id, "❌ Такой АЗС нет. Выбери номер из списка.")
                 return
-            state["remaining"][fuel] = rem
-            await send_message(chat_id, f"✅ Остаток {rem}% сохранён")
-            state["fuel_index"] += 1
+            state["azs_id"] = azs_id
             state["step"] = "fuel"
+            state["fuel_status"] = {}
+            state["prices"] = {}
+            state["remaining"] = {}
+            state["fuel_index"] = 0
             await ask_fuel(chat_id, state)
         except ValueError:
-            await send_message(chat_id, "❌ Введите число от 0 до 100")
+            await send_message(chat_id, "❌ Введи номер АЗС из списка (например, 1)")
         return
     
-    # --- ЦЕНА (текстовый ввод) ---
-    if state.get("step") == "price_input":
-        fuel = state.get("current_fuel")
-        try:
-            price = float(text)
-            if price < 0:
-                await send_message(chat_id, "❌ Цена не может быть отрицательной")
-                return
-            state["prices"][fuel] = price
-            await send_message(chat_id, f"✅ Цена {price} руб сохранена")
-            state["fuel_index"] += 1
-            state["step"] = "fuel"
-            await ask_fuel(chat_id, state)
-        except ValueError:
-            await send_message(chat_id, "❌ Введите число (например, 52.50)")
+    # --- СТАТУС ТОПЛИВА ---
+    if state.get("step") == "fuel":
+        await handle_fuel_status(chat_id, state, text)
         return
     
-    # --- ОЧЕРЕДЬ (текстовый ввод) ---
+    # --- ОСТАТОК ---
+    if state.get("step") == "remaining":
+        await handle_remaining(chat_id, state, text)
+        return
+    
+    # --- ЦЕНА ---
+    if state.get("step") == "price":
+        await handle_price(chat_id, state, text)
+        return
+    
+    # --- ОЧЕРЕДЬ ---
     if state.get("step") == "queue":
-        try:
-            q = int(text)
-            if q < 0:
-                await send_message(chat_id, "❌ Количество машин не может быть отрицательным")
-                return
-            state["queue"] = q
-            state["step"] = "photo"
-            await send_message(chat_id, "📸 Отправьте фото заправки (или напишите 'пропустить')")
-        except ValueError:
-            await send_message(chat_id, "❌ Введите число машин в очереди")
+        await handle_queue(chat_id, state, text)
         return
     
     # --- ПРОПУСК ФОТО ---
     if state.get("step") == "photo" and text.lower() in ["пропустить", "skip", "пропуск", "нет"]:
         await send_report_to_app(chat_id, state)
-        if chat_id in user_states:
-            del user_states[chat_id]
+        del user_states[chat_id]
         return
+    
+    await send_message(chat_id, "❌ Я не понял. Напиши номер или 'пропустить'.")
 
-# --- ОБРАБОТКА ФОТО ---
+async def ask_fuel(chat_id, state):
+    idx = state.get("fuel_index", 0)
+    if idx >= len(FUEL_TYPES):
+        state["step"] = "queue"
+        await send_message(chat_id, "🚗 Введи количество машин в очереди (число):")
+        return
+    
+    fuel = FUEL_TYPES[idx]
+    msg = f"📊 Статус для {FUEL_NAMES[fuel]}:\n"
+    msg += "Напиши:\n1 — есть\n2 — нет\n3 — слив\n(или 'пропустить')"
+    await send_message(chat_id, msg)
+    state["current_fuel"] = fuel
+
+async def handle_fuel_status(chat_id, state, text):
+    text = text.strip().lower()
+    fuel = state.get("current_fuel")
+    if not fuel:
+        return
+    
+    if text in ["пропустить", "skip", "пропуск"]:
+        state["fuel_index"] += 1
+        await ask_fuel(chat_id, state)
+        return
+    
+    status_map = {
+        "1": "available", "2": "unavailable", "3": "refueling",
+        "есть": "available", "нет": "unavailable", "слив": "refueling"
+    }
+    status = status_map.get(text)
+    if not status:
+        await send_message(chat_id, "❌ Напиши 1 (есть), 2 (нет) или 3 (слив)")
+        return
+    
+    state["fuel_status"][fuel] = status
+    await send_message(chat_id, f"✅ {FUEL_NAMES[fuel]} = {status}")
+    state["step"] = "remaining"
+    await send_message(chat_id, f"📊 Введи остаток для {FUEL_NAMES[fuel]} в % (0-100), или 'пропустить':")
+
+async def handle_remaining(chat_id, state, text):
+    text = text.strip().lower()
+    fuel = state.get("current_fuel")
+    if not fuel:
+        return
+    
+    if text in ["пропустить", "skip", "пропуск"]:
+        state["step"] = "price"
+        await send_message(chat_id, f"💰 Введи цену для {FUEL_NAMES[fuel]} (например, 52.50), или 'пропустить':")
+        return
+    
+    try:
+        rem = int(text)
+        if rem < 0 or rem > 100:
+            await send_message(chat_id, "❌ Остаток должен быть от 0 до 100%")
+            return
+        state["remaining"][fuel] = rem
+        await send_message(chat_id, f"✅ Остаток {rem}% сохранён")
+        state["step"] = "price"
+        await send_message(chat_id, f"💰 Введи цену для {FUEL_NAMES[fuel]} (например, 52.50), или 'пропустить':")
+    except ValueError:
+        await send_message(chat_id, "❌ Введи число от 0 до 100")
+
+async def handle_price(chat_id, state, text):
+    text = text.strip().lower()
+    fuel = state.get("current_fuel")
+    if not fuel:
+        return
+    
+    if text in ["пропустить", "skip", "пропуск"]:
+        state["fuel_index"] += 1
+        state["step"] = "fuel"
+        await ask_fuel(chat_id, state)
+        return
+    
+    try:
+        price = float(text)
+        if price < 0:
+            await send_message(chat_id, "❌ Цена не может быть отрицательной")
+            return
+        state["prices"][fuel] = price
+        await send_message(chat_id, f"✅ Цена {price} руб сохранена")
+        state["fuel_index"] += 1
+        state["step"] = "fuel"
+        await ask_fuel(chat_id, state)
+    except ValueError:
+        await send_message(chat_id, "❌ Введи число (например, 52.50)")
+
+async def handle_queue(chat_id, state, text):
+    try:
+        q = int(text.strip())
+        if q < 0:
+            await send_message(chat_id, "❌ Количество машин не может быть отрицательным")
+            return
+        state["queue"] = q
+        state["step"] = "photo"
+        await send_message(chat_id, "📸 Отправь фото заправки (или напиши 'пропустить')")
+    except ValueError:
+        await send_message(chat_id, "❌ Введи число машин в очереди")
+
 @dp.message_created(F.message.body.photo)
 async def handle_photo(event: MessageCreated):
     chat_id = get_chat_id(event)
@@ -366,9 +280,8 @@ async def handle_photo(event: MessageCreated):
             del user_states[chat_id]
     except Exception as e:
         logging.error(f"Ошибка фото: {e}")
-        await send_message(chat_id, "❌ Не удалось загрузить фото. Попробуйте еще раз.")
+        await send_message(chat_id, "❌ Не удалось загрузить фото. Попробуй еще раз.")
 
-# --- ЗАПУСК ---
 async def main():
     await dp.start_polling(bot)
 
