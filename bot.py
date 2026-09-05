@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import logging
 from collections import deque
 
@@ -15,124 +14,110 @@ HEADERS = {"Authorization": TOKEN, "Content-Type": "application/json"}
 
 _SEEN = deque(maxlen=200)
 
-def send_message(chat_id, text, keyboard=None):
-    """Отправка сообщения в MAX"""
-    url = f"{API}/messages"
-    
-    # chat_id передаем как СТРОКУ
-    payload = {
-        "recipient": {
-            "chat_id": str(chat_id)  # <-- ВОТ ЭТО ГЛАВНОЕ
-        },
-        "message": {
-            "text": text
-        }
-    }
-    
-    if keyboard:
-        payload["message"]["inline_keyboard"] = keyboard
-    
-    try:
-        resp = requests.post(url, headers=HEADERS, json=payload, timeout=10)
-        
-        if resp.status_code == 429:
-            wait = int(resp.headers.get("Retry-After", 5))
-            log.warning(f"429, ждём {wait} сек")
-            time.sleep(wait)
-            return send_message(chat_id, text, keyboard)
-        
-        if resp.ok:
-            log.info(f"✅ Отправлено: {text[:50]}...")
-        else:
-            log.error(f"❌ Ошибка: {resp.status_code} {resp.text[:200]}")
-    except Exception as e:
-        log.error(f"❌ Ошибка отправки: {e}")
-
-def answer_callback(callback_id, notification="Готово"):
-    if not callback_id:
-        return
-    try:
-        resp = requests.post(
-            f"{API}/answers",
-            headers=HEADERS,
-            params={"callback_id": callback_id},
-            json={"notification": notification},
-            timeout=10,
-        )
-        if not resp.ok:
-            log.error(f"❌ Ошибка callback: {resp.status_code}")
-    except Exception as e:
-        log.error(f"❌ Ошибка callback: {e}")
-
-def handle_update(update):
-    ut = update.get("update_type")
-    
-    if ut == "message_created":
-        msg = update.get("message", {})
-        recipient = msg.get("recipient", {})
-        chat_id = recipient.get("chat_id")
-        body = msg.get("body", {})
-        text = (body.get("text") or "").strip()
-        
-        if chat_id is None:
-            return
-        
-        # Для дебага: выводим chat_id
-        log.info(f"Сообщение от chat_id: {chat_id} (тип: {type(chat_id)})")
-        
-        if text.startswith("/start"):
-            keyboard = {
-                "inline_keyboard": [
-                    [{"text": "Лукойл №13202", "callback_data": "azs_1"}],
-                    [{"text": "Татнефть №16", "callback_data": "azs_2"}],
-                    [{"text": "Башнефть Косарева", "callback_data": "azs_3"}]
-                ]
-            }
-            send_message(chat_id, "⛽ Выберите АЗС:", keyboard)
-        elif text == "/help":
-            send_message(chat_id, "Доступно:\n/start - начать\n/help - помощь")
-        else:
-            send_message(chat_id, f"Вы написали: {text}")
-    
-    elif ut == "message_callback":
-        cb = update.get("callback", {})
-        callback_id = cb.get("callback_id")
-        payload = cb.get("payload", "")
-        msg = cb.get("message", {})
-        recipient = msg.get("recipient", {})
-        chat_id = recipient.get("chat_id")
-        
-        answer_callback(callback_id, "Принято")
-        
-        if chat_id is not None:
-            send_message(chat_id, f"Вы выбрали: {payload}")
-    
-    elif ut == "bot_added":
-        log.info(f"Бот добавлен в чат: {update.get('chat_id')}")
+def dedup_key(update: dict) -> tuple:
+    msg = update.get("message") or {}
+    body = msg.get("body") or {}
+    mid = body.get("mid")
+    cb = update.get("callback") or {}
+    return (
+        update.get("update_type"),
+        update.get("timestamp"),
+        mid,
+        cb.get("callback_id"),
+    )
 
 def poll_updates(marker=None, timeout=30):
     params = {"timeout": timeout, "limit": 100}
-    if marker:
+    if marker is not None:
         params["marker"] = marker
-    resp = requests.get(f"{API}/updates", headers=HEADERS, params=params, timeout=timeout + 10)
-    resp.raise_for_status()
-    return resp.json()
+    r = requests.get(f"{API}/updates", headers=HEADERS, params=params, timeout=timeout + 10)
+    r.raise_for_status()
+    return r.json()
+
+def send_message_safe(chat_id: int, text: str, retries: int = 3) -> None:
+    url = f"{API}/messages"
+    body = {"chat_id": chat_id, "text": text}
+    for attempt in range(retries):
+        resp = requests.post(url, headers=HEADERS, json=body, timeout=20)
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", 5))
+            log.warning("429 messages, ждём %s с (попытка %s)", wait, attempt + 1)
+            time.sleep(wait)
+            continue
+        if not resp.ok:
+            log.error("messages: %s %s", resp.status_code, resp.text[:400])
+        else:
+            break
+
+def answer_callback(callback_id: str, notification: str = "Готово") -> None:
+    if not callback_id:
+        return
+    r = requests.post(
+        f"{API}/answers",
+        headers=HEADERS,
+        params={"callback_id": callback_id},
+        json={"notification": notification},
+        timeout=15,
+    )
+    if not r.ok:
+        log.error("answers: %s %s", r.status_code, r.text[:300])
+
+def handle_update(update: dict) -> None:
+    key = dedup_key(update)
+    if key in _SEEN:
+        return
+    _SEEN.append(key)
+
+    ut = update.get("update_type")
+
+    if ut == "message_created":
+        msg = update.get("message") or {}
+        recipient = msg.get("recipient") or {}
+        chat_id = recipient.get("chat_id")
+        body = msg.get("body") or {}
+        text = (body.get("text") or "").strip()
+        if chat_id is None:
+            return
+
+        if text.startswith("/start"):
+            parts = text.split(maxsplit=1)
+            payload = parts[1] if len(parts) > 1 else ""
+            if payload:
+                send_message_safe(int(chat_id), f"Старт с параметром: {payload}")
+            else:
+                send_message_safe(int(chat_id), "Привет! Напишите /help.")
+        elif text == "/help":
+            send_message_safe(int(chat_id), "Доступно:\n/start [код]\n/help")
+        else:
+            send_message_safe(int(chat_id), f"Вы написали: {text}")
+
+    elif ut == "message_callback":
+        cb = update.get("callback") or {}
+        callback_id = cb.get("callback_id")
+        payload = cb.get("payload", "")
+        msg = cb.get("message") or {}
+        recipient = msg.get("recipient") or {}
+        chat_id = recipient.get("chat_id")
+
+        answer_callback(callback_id, "Принято")
+        if chat_id is not None:
+            send_message_safe(int(chat_id), f"Нажата кнопка, payload: {payload}")
+
+    elif ut == "bot_added":
+        log.info("Бот добавлен в чат: %s", update.get("chat_id"))
 
 def main():
     marker = None
-    log.info("🚀 Бот запущен (long polling)")
+    log.info("Бот запущен (long polling). Остановка: Ctrl+C")
     while True:
         try:
             data = poll_updates(marker)
-            for update in data.get("updates", []):
-                handle_update(update)
-            if data.get("marker"):
+            for u in data.get("updates") or []:
+                handle_update(u)
+            if data.get("marker") is not None:
                 marker = data["marker"]
         except requests.RequestException as e:
-            log.warning(f"Сеть/API: {e} — пауза 5 сек")
-            time.sleep(5)
-        except Exception as e:
-            log.error(f"Ошибка: {e}")
+            log.warning("Сеть/API: %s — пауза 5 с", e)
             time.sleep(5)
 
 if __name__ == "__main__":
