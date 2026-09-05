@@ -29,40 +29,24 @@ AZS_LIST = [
 ]
 user_states = {}
 
-# Жёстко задаём chat_id из логов
 MY_CHAT_ID = "512925955"
 
-async def send_message(event, text):
-    """Отправка сообщения в известный chat_id"""
+async def send_message(text):
+    """Отправка сообщения через bot.send_message"""
     try:
-        # Пробуем отправить через bot.send_message
         await bot.send_message(MY_CHAT_ID, text)
-        logging.info(f"Отправлено сообщение в chat_id={MY_CHAT_ID}")
+        logging.info(f"✅ Отправлено: {text[:50]}...")
     except Exception as e:
-        logging.error(f"Ошибка отправки через bot.send_message: {e}")
-        # Если не работает — пробуем через прямой API
-        try:
-            url = "https://api.max.ru/bot/sendMessage"
-            payload = {"chat_id": MY_CHAT_ID, "text": text}
-            headers = {"Authorization": f"Bearer {MAX_BOT_TOKEN}"}
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers) as resp:
-                    if resp.status == 200:
-                        logging.info(f"Отправлено через прямой API в chat_id={MY_CHAT_ID}")
-                    else:
-                        logging.error(f"Ошибка прямого API: {resp.status} {await resp.text()}")
-        except Exception as e2:
-            logging.error(f"Ошибка прямого API: {e2}")
+        logging.error(f"❌ Ошибка bot.send_message: {e}")
 
 # --- ОБРАБОТЧИКИ ---
 @dp.bot_started()
 async def start(event: BotStarted):
-    await send_message(event, "👋 Привет! Напиши /start")
+    await send_message("👋 Привет! Напиши /start")
 
 @dp.message_created(CommandStart())
 async def cmd_start(event: MessageCreated):
-    await send_message(event, "⛽ Привет! Я бот для сбора отчетов. Сейчас я работаю в тестовом режиме.")
-    # Далее можно добавить полную логику, но сначала проверим, что ответ доходит.
+    await send_message("⛽ Привет! Я бот для сбора отчетов. Я работаю!")
 
 # --- ЗАПУСК ---
 async def main():
