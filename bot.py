@@ -9,22 +9,20 @@ import requests
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("max-bot")
 
-# ===== КОНФИГ =====
 API = "https://platform-api.max.ru"
 TOKEN = "f9LHodD0cOIv3pssaR8kV9WyEVMdYmHoyXHjxLnQtCSRcENWj-6f9ZhyxsQC6qK8F7qOSqpCgIwTkRN8q9NM"
 HEADERS = {"Authorization": TOKEN, "Content-Type": "application/json"}
 
 _SEEN = deque(maxlen=200)
 
-# ===== ФУНКЦИЯ ОТПРАВКИ =====
-def send_message(chat_id: int, text: str, keyboard=None):
-    """Отправка сообщения по схеме из документации MAX"""
+def send_message(chat_id, text, keyboard=None):
+    """Отправка сообщения в MAX"""
     url = f"{API}/messages"
     
-    # Правильная структура для MAX
+    # chat_id передаем как СТРОКУ
     payload = {
         "recipient": {
-            "chat_id": chat_id
+            "chat_id": str(chat_id)  # <-- ВОТ ЭТО ГЛАВНОЕ
         },
         "message": {
             "text": text
@@ -50,7 +48,7 @@ def send_message(chat_id: int, text: str, keyboard=None):
     except Exception as e:
         log.error(f"❌ Ошибка отправки: {e}")
 
-def answer_callback(callback_id: str, notification: str = "Готово"):
+def answer_callback(callback_id, notification="Готово"):
     if not callback_id:
         return
     try:
@@ -62,11 +60,10 @@ def answer_callback(callback_id: str, notification: str = "Готово"):
             timeout=10,
         )
         if not resp.ok:
-            log.error(f"❌ Ошибка callback: {resp.status_code} {resp.text[:200]}")
+            log.error(f"❌ Ошибка callback: {resp.status_code}")
     except Exception as e:
         log.error(f"❌ Ошибка callback: {e}")
 
-# ===== ОБРАБОТКА СОБЫТИЙ =====
 def handle_update(update):
     ut = update.get("update_type")
     
@@ -80,6 +77,9 @@ def handle_update(update):
         if chat_id is None:
             return
         
+        # Для дебага: выводим chat_id
+        log.info(f"Сообщение от chat_id: {chat_id} (тип: {type(chat_id)})")
+        
         if text.startswith("/start"):
             keyboard = {
                 "inline_keyboard": [
@@ -89,10 +89,8 @@ def handle_update(update):
                 ]
             }
             send_message(chat_id, "⛽ Выберите АЗС:", keyboard)
-        
         elif text == "/help":
             send_message(chat_id, "Доступно:\n/start - начать\n/help - помощь")
-        
         else:
             send_message(chat_id, f"Вы написали: {text}")
     
@@ -112,7 +110,6 @@ def handle_update(update):
     elif ut == "bot_added":
         log.info(f"Бот добавлен в чат: {update.get('chat_id')}")
 
-# ===== ПОЛЛИНГ =====
 def poll_updates(marker=None, timeout=30):
     params = {"timeout": timeout, "limit": 100}
     if marker:
