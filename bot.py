@@ -63,11 +63,11 @@ def get_session(user_id):
 def get_chat_id(event):
     """Получить chat_id из любого события"""
     if hasattr(event, "chat_id"):
-        return event.chat_id
+        return str(event.chat_id)
     if hasattr(event, "message") and hasattr(event.message, "recipient"):
-        return event.message.recipient.chat_id
+        return str(event.message.recipient.chat_id)
     if hasattr(event, "message") and hasattr(event.message, "chat_id"):
-        return event.message.chat_id
+        return str(event.message.chat_id)
     return None
 
 def make_keyboard(buttons):
@@ -79,9 +79,15 @@ def make_button(text, callback_data):
 
 # ===== ОТПРАВКА =====
 async def send_message(chat_id, text, keyboard=None):
+    """Отправка сообщения через bot.send_message с правильной структурой"""
     try:
+        # Правильная структура для MAX — recipient с chat_id как строка
         if keyboard:
-            await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+            await bot.send_message(
+                chat_id=chat_id, 
+                text=text, 
+                reply_markup=keyboard
+            )
         else:
             await bot.send_message(chat_id=chat_id, text=text)
         logger.info(f"✅ Отправлено: {text[:50]}...")
