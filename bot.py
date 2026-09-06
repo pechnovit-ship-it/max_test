@@ -14,7 +14,7 @@ MAX_BOT_TOKEN = os.environ.get(
     "BOT_TOKEN",
     "f9LHodD0cOIv3pssaR8kV9WyEVMdYmHoyXHjxLnQtCSRcENWj-6f9ZhyxsQC6qK8F7qOSqpCgIwTkRN8q9NM"
 )
-BOT_SECRET = os.environ.get("MAX_BOT_SECRET", "")
+BOT_SECRET = "F7kL9mN2pQ5rS8tU1vW3xY4zA6bC0dE9"
 WEBHOOK_URL = "https://data-reporting-via-a-bot.pechnovit.workers.dev/api/public/bot/report"
 
 logging.basicConfig(level=logging.INFO)
