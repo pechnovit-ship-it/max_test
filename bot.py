@@ -175,6 +175,10 @@ async def finalize_report(chat_id: int, user_id: str):
     session["state"] = "start"
 
 # --- ЗАПУСК ---
+async def main():
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
+    import asyncio
     logging.basicConfig(level=logging.INFO)
-    dp.run_polling()
+    asyncio.run(main())
