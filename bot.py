@@ -2,23 +2,23 @@ import os
 import base64
 import aiohttp
 import logging
+import re
 from maxapi import Dispatcher, Bot, F
 from maxapi.types import MessageCreated
 
 # --- КОНФИГУРАЦИЯ ---
-# Ключ теперь подтягивается из переменных окружения (Cloudflare Worker: MAX_BOT_SECRET)
+# Ключ теперь подтягивается из переменных окружения
 BOT_SECRET = os.environ.get("MAX_BOT_SECRET")
 if not BOT_SECRET:
     raise ValueError("❌ Ошибка: переменная окружения MAX_BOT_SECRET не найдена!")
 
-# URL вашего Cloudflare Worker (куда бот будет слать отчёты)
 REPORT_WORKER_URL = "https://data-reporting-via-a-bot.pechnovit.workers.dev"
 
-# Инициализация
-bot = Bot(secret=BOT_SECRET)
+# Инициализация: УБРАЛИ secret=BOT_SECRET, так как класс Bot этого не ожидает
+bot = Bot()
 dp = Dispatcher(bot)
 
-# Простой словарь для хранения состояний пользователей (в продакшене лучше использовать Redis/DB)
+# Простой словарь для хранения состояний пользователей
 user_sessions = {}
 
 def get_session(user_id: str):
@@ -111,8 +111,7 @@ async def handle_skip(event: MessageCreated):
         session["report"]["note"] = "Пропущено"
         await finalize_report(chat_id, user_id)
 
-# --- ИСПРАВЛЕННЫЙ ХЕНДЛЕР ДЛЯ ФОТО ---
-# Ключевое изменение: F.message.body.attachments вместо несуществующего F.message.attachments
+# --- ХЕНДЛЕР ДЛЯ ФОТО ---
 @dp.message_created(F.message.body.attachments)
 async def handle_attachments(event: MessageCreated):
     chat_id = event.message.recipient.chat_id
@@ -152,7 +151,6 @@ async def finalize_report(chat_id: int, user_id: str):
     session = get_session(user_id)
     report_data = session["report"]
     
-    # Формируем payload для отправки на ваш воркер
     payload = {
         "chat_id": chat_id,
         "user_id": user_id,
@@ -161,7 +159,10 @@ async def finalize_report(chat_id: int, user_id: str):
     
     try:
         async with aiohttp.ClientSession() as session_http:
-            async with session_http.post(REPORT_WORKER_URL, json=payload) as resp:
+            # <--- ГЛАВНОЕ ИСПРАВЛЕНИЕ: Добавлен headers с секретом
+            headers = {"Authorization": f"Bearer {BOT_SECRET}"}
+            
+            async with session_http.post(REPORT_WORKER_URL, json=payload, headers=headers) as resp:
                 if resp.status == 200:
                     await send_message(chat_id, "💾 Отчёт успешно отправлен на сервер!")
                 else:
@@ -175,6 +176,5 @@ async def finalize_report(chat_id: int, user_id: str):
 
 # --- ЗАПУСК ---
 if __name__ == "__main__":
-    import re
     logging.basicConfig(level=logging.INFO)
     dp.run_polling()
