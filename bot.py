@@ -1,7 +1,20 @@
+"""Бот MAX для «Топливного монитора».
+
+Короткий опрос: АЗС -> статусы топлива одним экраном -> одна строка подробностей ->
+фото (не обязательно) -> подтверждение.
+
+Переменные окружения BotHost:
+  BOT_TOKEN    — токен бота MAX
+  BOT_SECRET   — общий ключ приложения (заголовок x-bot-secret)
+  APP_API_URL  — адрес приложения, например https://example.workers.dev
+"""
+
 import asyncio
 import base64
 import logging
 import os
+import re
+import time
 from typing import Any
 
 import aiohttp
@@ -18,95 +31,100 @@ def required_env(name: str) -> str:
     return value
 
 
-MAX_BOT_TOKEN = required_env("BOT_TOKEN")
+BOT_TOKEN = required_env("BOT_TOKEN")
 BOT_SECRET = required_env("BOT_SECRET")
 APP_API_URL = required_env("APP_API_URL").rstrip("/")
 REPORT_URL = f"{APP_API_URL}/api/public/bot/report"
 AZS_URL = f"{APP_API_URL}/api/public/bot/azs"
+
 MAX_PHOTO_BYTES = 5 * 1024 * 1024
 AZS_PAGE_SIZE = 8
-REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+AZS_CACHE_TTL = 300          # список АЗС живёт 5 минут
+SESSION_TTL = 30 * 60        # диалог живёт 30 минут
+TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=MAX_BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 FUEL_TYPES = [
-    {"key": "92", "name": "АИ-92"},
-    {"key": "95", "name": "АИ-95"},
-    {"key": "98", "name": "АИ-98"},
-    {"key": "100", "name": "АИ-100"},
-    {"key": "dt", "name": "ДТ"},
-    {"key": "gas", "name": "ГАЗ"},
+    ("92", "92"),
+    ("95", "95"),
+    ("98", "98"),
+    ("100", "100"),
+    ("dt", "ДТ"),
+    ("gas", "ГАЗ"),
 ]
+FUEL_NAMES = dict(FUEL_TYPES)
+FUEL_ALIASES = {"дт": "dt", "dt": "dt", "газ": "gas", "gas": "gas", "92": "92", "95": "95", "98": "98", "100": "100"}
 
-STATUS_LABELS = {
-    "available": "Есть",
-    "unavailable": "Нет",
-    "refueling": "Слив",
-}
+STATUS_CYCLE = ["available", "unavailable", "refueling"]
+STATUS_MARK = {"available": "✅", "unavailable": "⛔", "refueling": "🚚", None: "—"}
+STATUS_LABELS = {"available": "есть", "unavailable": "нет", "refueling": "завоз"}
 
 RESTRICTIONS = {
-    "none": "Нет ограничений",
-    "special_only": "Только спецтранспорт",
-    "limit_20l": "Не более 20 л",
-    "closed": "АЗС закрыта",
+    "none": "нет",
+    "special_only": "только спецтранспорт",
+    "limit_20l": "не более 20 л",
+    "closed": "закрыта",
 }
 
-user_sessions: dict[str, dict[str, Any]] = {}
-azs_cache: list[dict[str, Any]] = []
+sessions: dict[str, dict[str, Any]] = {}
+_azs_cache: dict[str, Any] = {"rows": [], "at": 0.0}
+
+
+# ---------------------------------------------------------------- состояние
 
 
 def new_session(user_id: str) -> dict[str, Any]:
     return {
-        "state": "start",
-        "report": {
-            "max_user_id": user_id,
-            "azs_id": None,
-            "operator_name": "Оператор",
-            "fuel_status": {},
-            "queue_length": 0,
-            "restriction_type": "none",
-            "prices": {},
-            "remaining_pct": {},
-            "remaining_l": {},
-            "photo_base64": None,
-            "note": "",
-        },
-        "current_fuel_index": 0,
-        "current_fuel": None,
+        "touched": time.time(),
+        "state": "azs",
+        "azs_id": None,
         "azs_name": None,
+        "fuel_status": {},
+        "prices": {},
+        "remaining_pct": {},
+        "remaining_l": {},
+        "queue_length": None,
+        "restriction_type": "none",
+        "note": "",
+        "photo_base64": None,
+        "user_id": user_id,
     }
 
 
-def get_session(user_id: str) -> dict[str, Any]:
-    if user_id not in user_sessions:
-        user_sessions[user_id] = new_session(user_id)
-    return user_sessions[user_id]
+def get_session(user_id: str) -> dict[str, Any] | None:
+    session = sessions.get(user_id)
+    if not session:
+        return None
+    if time.time() - session["touched"] > SESSION_TTL:
+        sessions.pop(user_id, None)
+        return None
+    session["touched"] = time.time()
+    return session
 
 
-def make_keyboard(rows: list[list[tuple[str, str]]]):
-    keyboard = InlineKeyboardBuilder()
+# ---------------------------------------------------------------- транспорт
+
+
+def keyboard(rows: list[list[tuple[str, str]]]):
+    builder = InlineKeyboardBuilder()
     for row in rows:
-        keyboard.row(*[CallbackButton(text=text, payload=payload) for text, payload in row])
-    return keyboard.as_markup()
+        builder.row(*[CallbackButton(text=text, payload=payload) for text, payload in row])
+    return builder.as_markup()
 
 
-def api_headers() -> dict[str, str]:
-    return {"x-bot-secret": BOT_SECRET}
-
-
-async def send_message(chat_id: int, text: str, keyboard=None) -> None:
+async def say(chat_id: int, text: str, markup=None) -> None:
     try:
-        attachments = [keyboard] if keyboard else None
-        await bot.send_message(chat_id=chat_id, text=text, attachments=attachments)
+        await bot.send_message(chat_id=chat_id, text=text, attachments=[markup] if markup else None)
     except Exception:
         logger.exception("Не удалось отправить сообщение в MAX")
 
 
-async def read_api_response(response: aiohttp.ClientResponse) -> dict[str, Any]:
+async def read_json(response: aiohttp.ClientResponse) -> dict[str, Any]:
     try:
         payload = await response.json(content_type=None)
         return payload if isinstance(payload, dict) else {}
@@ -114,353 +132,378 @@ async def read_api_response(response: aiohttp.ClientResponse) -> dict[str, Any]:
         return {}
 
 
-async def fetch_azs() -> tuple[list[dict[str, Any]], str | None]:
-    global azs_cache
+async def fetch_azs(force: bool = False) -> tuple[list[dict[str, Any]], str | None]:
+    if not force and _azs_cache["rows"] and time.time() - _azs_cache["at"] < AZS_CACHE_TTL:
+        return _azs_cache["rows"], None
     try:
-        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as http:
-            async with http.get(AZS_URL, headers=api_headers()) as response:
-                payload = await read_api_response(response)
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as http:
+            async with http.get(AZS_URL, headers={"x-bot-secret": BOT_SECRET}) as response:
+                payload = await read_json(response)
                 if response.status != 200 or not payload.get("success"):
-                    return [], str(payload.get("error") or f"Ошибка сервера {response.status}")
-                rows = payload.get("azs")
-                if not isinstance(rows, list):
-                    return [], "Сервер вернул некорректный список АЗС"
-                azs_cache = [row for row in rows if isinstance(row, dict)]
-                return azs_cache, None
+                    return [], str(payload.get("error") or f"ошибка сервера {response.status}")
+                rows = [r for r in payload.get("azs") or [] if isinstance(r, dict) and r.get("id")]
+                if not rows:
+                    return [], "в приложении пока нет ни одной АЗС"
+                _azs_cache.update(rows=rows, at=time.time())
+                return rows, None
     except asyncio.TimeoutError:
-        return [], "Приложение не ответило за 30 секунд"
+        return [], "приложение не ответило за 30 секунд"
     except Exception:
         logger.exception("Не удалось получить список АЗС")
-        return [], "Нет связи с приложением"
+        return [], "нет связи с приложением"
 
 
-async def send_report_to_app(user_id: str) -> tuple[bool, str]:
-    report = get_session(user_id)["report"]
+async def post_report(session: dict[str, Any]) -> tuple[bool, str]:
+    body = {
+        "max_user_id": session["user_id"],
+        "operator_name": session.get("operator_name") or "Оператор",
+        "azs_id": session["azs_id"],
+        "fuel_status": session["fuel_status"],
+        "queue_length": session["queue_length"],
+        "restriction_type": session["restriction_type"],
+        "note": session["note"] or None,
+        "photo_base64": session["photo_base64"],
+        "prices": session["prices"],
+        "remaining_pct": session["remaining_pct"],
+        "remaining_l": session["remaining_l"],
+    }
     try:
-        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as http:
-            async with http.post(REPORT_URL, json=report, headers=api_headers()) as response:
-                payload = await read_api_response(response)
-                if response.status == 200 and payload.get("success") is True:
-                    report_id = payload.get("report_id")
-                    logger.info("Отчёт принят, id=%s", report_id)
-                    return True, "Отчёт принят приложением"
-                error = str(payload.get("error") or f"Ошибка сервера {response.status}")
-                details = payload.get("details")
-                if details:
-                    logger.error("Ошибка валидации отчёта: %s", details)
-                return False, error
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as http:
+            async with http.post(REPORT_URL, json=body, headers={"x-bot-secret": BOT_SECRET}) as response:
+                payload = await read_json(response)
+                if 200 <= response.status < 300 and payload.get("success"):
+                    return True, f"отчёт №{payload.get('report_id')} принят"
+                if payload.get("details"):
+                    logger.error("Отчёт отклонён: %s", payload["details"])
+                return False, str(payload.get("error") or f"ошибка сервера {response.status}")
     except asyncio.TimeoutError:
-        return False, "Приложение не ответило за 30 секунд"
+        return False, "приложение не ответило за 30 секунд"
     except Exception:
         logger.exception("Не удалось отправить отчёт")
-        return False, "Нет связи с приложением"
+        return False, "нет связи с приложением"
 
 
-def detect_image_mime(data: bytes) -> str | None:
-    if data.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    return None
+# ---------------------------------------------------------------- экраны
+
+
+async def screen_azs(chat_id: int, user_id: str, page: int = 0, query: str = "") -> None:
+    rows, error = await fetch_azs()
+    if error:
+        await say(chat_id, f"Не удалось получить список АЗС: {error}.", keyboard([[("Повторить", "azs_reload")]]))
+        return
+    session = get_session(user_id) or sessions.setdefault(user_id, new_session(user_id))
+    session["state"] = "azs"
+    if query:
+        rows = [r for r in rows if query.lower() in str(r.get("name", "")).lower()
+                or query.lower() in str(r.get("address", "")).lower()]
+        if not rows:
+            await say(chat_id, "Ничего не нашлось. Введите другую часть названия.")
+            return
+    session["found"] = [r["id"] for r in rows]
+    pages = max(1, (len(rows) + AZS_PAGE_SIZE - 1) // AZS_PAGE_SIZE)
+    page = min(max(page, 0), pages - 1)
+    session["page"] = page
+    session["query"] = query
+    buttons = [[(str(r.get("name") or f"АЗС {r['id']}"), f"azs_{r['id']}")]
+               for r in rows[page * AZS_PAGE_SIZE:(page + 1) * AZS_PAGE_SIZE]]
+    nav = []
+    if page > 0:
+        nav.append(("‹ Назад", f"azspage_{page - 1}"))
+    if page + 1 < pages:
+        nav.append(("Далее ›", f"azspage_{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    await say(chat_id, f"Выберите АЗС ({page + 1}/{pages}) или напишите часть названия:", keyboard(buttons))
+
+
+def fuel_text(session: dict[str, Any]) -> str:
+    marks = "  ".join(f"{name} {STATUS_MARK[session['fuel_status'].get(key)]}" for key, name in FUEL_TYPES)
+    return (f"{session['azs_name']}\n{marks}\n\n"
+            "Нажимайте на топливо: ✅ есть → ⛔ нет → 🚚 завоз. Затем «Готово».")
+
+
+async def screen_fuel(chat_id: int, user_id: str) -> None:
+    session = get_session(user_id)
+    if not session:
+        await lost(chat_id, user_id)
+        return
+    session["state"] = "fuel"
+    buttons = [
+        [(f"{FUEL_NAMES[k]} {STATUS_MARK[session['fuel_status'].get(k)]}", f"f_{k}") for k in ("92", "95", "98")],
+        [(f"{FUEL_NAMES[k]} {STATUS_MARK[session['fuel_status'].get(k)]}", f"f_{k}") for k in ("100", "dt", "gas")],
+        [("Все есть", "f_all_ok"), ("Готово", "f_done")],
+    ]
+    await say(chat_id, fuel_text(session), keyboard(buttons))
+
+
+async def screen_details(chat_id: int, user_id: str) -> None:
+    session = get_session(user_id)
+    if not session:
+        await lost(chat_id, user_id)
+        return
+    session["state"] = "details"
+    await say(
+        chat_id,
+        "Подробности одной строкой (можно пропустить):\n"
+        "например: 95 80% 59.9  дт 40% 1000л  очередь 7  лимит20\n\n"
+        "Слова: очередь N, лимит20, спец, закрыта. Остальной текст станет примечанием.",
+        keyboard([[("Пропустить", "d_skip")]]),
+    )
+
+
+async def screen_photo(chat_id: int, user_id: str) -> None:
+    session = get_session(user_id)
+    if not session:
+        await lost(chat_id, user_id)
+        return
+    session["state"] = "photo"
+    await say(chat_id, "Пришлите фото (до 5 МБ) или нажмите «Без фото».", keyboard([[("Без фото", "p_skip")]]))
+
+
+async def screen_summary(chat_id: int, user_id: str) -> None:
+    session = get_session(user_id)
+    if not session:
+        await lost(chat_id, user_id)
+        return
+    session["state"] = "summary"
+    lines = [session["azs_name"] or "АЗС не выбрана"]
+    for key, name in FUEL_TYPES:
+        status = session["fuel_status"].get(key)
+        if not status:
+            continue
+        extra = []
+        if key in session["remaining_pct"]:
+            extra.append(f"{session['remaining_pct'][key]}%")
+        if key in session["remaining_l"]:
+            extra.append(f"{session['remaining_l'][key]} л")
+        if key in session["prices"]:
+            extra.append(f"{session['prices'][key]} ₽")
+        lines.append(f"{name}: {STATUS_LABELS[status]}" + (f" ({', '.join(extra)})" if extra else ""))
+    if session["queue_length"] is not None:
+        lines.append(f"Очередь: {session['queue_length']}")
+    if session["restriction_type"] != "none":
+        lines.append(f"Ограничение: {RESTRICTIONS[session['restriction_type']]}")
+    if session["note"]:
+        lines.append(f"Примечание: {session['note']}")
+    lines.append(f"Фото: {'есть' if session['photo_base64'] else 'нет'}")
+    await say(chat_id, "\n".join(lines),
+              keyboard([[("Отправить", "send"), ("Исправить", "again")], [("Отменить", "cancel")]]))
+
+
+async def lost(chat_id: int, user_id: str) -> None:
+    sessions.pop(user_id, None)
+    await say(chat_id, "Сессия сброшена — начнём заново.")
+    await screen_azs(chat_id, user_id, 0)
+
+
+# ---------------------------------------------------------------- разбор строки подробностей
+
+
+def parse_details(session: dict[str, Any], text: str) -> None:
+    rest: list[str] = []
+    current: str | None = None
+    for token in text.replace(",", " ").split():
+        low = token.lower().strip(".:;")
+        if low in FUEL_ALIASES:
+            current = FUEL_ALIASES[low]
+            continue
+        if low in ("лимит20", "20л", "лимит"):
+            session["restriction_type"] = "limit_20l"
+            continue
+        if low.startswith("спец"):
+            session["restriction_type"] = "special_only"
+            continue
+        if low.startswith("закрыт"):
+            session["restriction_type"] = "closed"
+            continue
+        if low.startswith("очеред") or low in ("оч", "очередь"):
+            session["_await_queue"] = True
+            continue
+        number = re.fullmatch(r"(\d+(?:[.,]\d+)?)(%|л|l|₽|р|руб)?", low)
+        if number:
+            value = float(number.group(1).replace(",", "."))
+            suffix = number.group(2)
+            if session.pop("_await_queue", False):
+                session["queue_length"] = max(0, min(1000, int(value)))
+                continue
+            if current and suffix == "%":
+                session["remaining_pct"][current] = max(0, min(100, int(value)))
+                continue
+            if current and suffix in ("л", "l"):
+                session["remaining_l"][current] = max(0, min(1_000_000, int(value)))
+                continue
+            if current:
+                session["prices"][current] = max(0.0, min(500.0, round(value, 2)))
+                continue
+        rest.append(token)
+    session.pop("_await_queue", None)
+    note = " ".join(rest).strip()
+    if note:
+        session["note"] = note[:200]
+
+
+# ---------------------------------------------------------------- обработчики
 
 
 @dp.bot_started()
 async def on_start(event: BotStarted):
-    await send_message(event.chat_id, "Привет! Напишите /start, чтобы отправить отчёт.")
+    await say(event.chat_id, "Здравствуйте! Напишите /start, чтобы отправить отчёт.")
 
 
 @dp.message_created(CommandStart())
 async def cmd_start(event: MessageCreated):
     chat_id = event.message.recipient.chat_id
     user_id = str(chat_id)
-    user_sessions[user_id] = new_session(user_id)
-    keyboard = make_keyboard([[("Начать отчёт", "start_report")]])
-    await send_message(chat_id, "Нажмите кнопку, чтобы начать новый отчёт.", keyboard)
+    sessions[user_id] = new_session(user_id)
+    await screen_azs(chat_id, user_id, 0)
 
 
 @dp.message_created(F.message.body.attachments)
-async def handle_attachments(event: MessageCreated):
+async def on_attachment(event: MessageCreated):
     chat_id = event.message.recipient.chat_id
     user_id = str(chat_id)
     session = get_session(user_id)
-    if session.get("state") != "photo":
+    if not session or session["state"] != "photo":
         return
-
     for attachment in event.message.body.attachments:
         if attachment.type != "image":
             continue
         try:
-            image_url = attachment.payload.url
-            if not image_url:
+            url = attachment.payload.url
+            if not url:
                 raise ValueError("MAX не вернул адрес изображения")
-            async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as http:
-                async with http.get(image_url) as response:
+            async with aiohttp.ClientSession(timeout=TIMEOUT) as http:
+                async with http.get(url) as response:
                     if response.status != 200:
                         raise ValueError(f"MAX вернул статус {response.status}")
                     image = await response.content.read(MAX_PHOTO_BYTES + 1)
             if len(image) > MAX_PHOTO_BYTES:
-                await send_message(chat_id, "Фото больше 5 МБ. Отправьте изображение меньшего размера.")
+                await say(chat_id, "Фото больше 5 МБ — пришлите поменьше.")
                 return
-            mime = detect_image_mime(image)
-            if not mime:
-                await send_message(chat_id, "Допустимы только фотографии JPEG, PNG или WEBP.")
+            if image.startswith(b"\xff\xd8\xff"):
+                mime = "image/jpeg"
+            elif image.startswith(b"\x89PNG\r\n\x1a\n"):
+                mime = "image/png"
+            elif len(image) >= 12 and image[:4] == b"RIFF" and image[8:12] == b"WEBP":
+                mime = "image/webp"
+            else:
+                await say(chat_id, "Подходят только JPEG, PNG или WEBP.")
                 return
-            encoded = base64.b64encode(image).decode("ascii")
-            session["report"]["photo_base64"] = f"data:{mime};base64,{encoded}"
-            await send_message(chat_id, "Фото добавлено.")
-            await ask_note(chat_id, user_id)
+            session["photo_base64"] = f"data:{mime};base64,{base64.b64encode(image).decode('ascii')}"
+            await screen_summary(chat_id, user_id)
             return
         except Exception:
             logger.exception("Ошибка обработки фото")
-            await send_message(chat_id, "Не удалось загрузить фото. Попробуйте ещё раз или пропустите.")
+            await say(chat_id, "Не удалось загрузить фото. Попробуйте ещё раз или нажмите «Без фото».")
             return
-
-    await send_message(chat_id, "Отправьте изображение JPEG, PNG или WEBP либо нажмите «Пропустить».")
 
 
 @dp.message_created(F.message.body.text)
-async def handle_text(event: MessageCreated):
+async def on_text(event: MessageCreated):
     chat_id = event.message.recipient.chat_id
     user_id = str(chat_id)
-    text = event.message.body.text.strip()
-    session = get_session(user_id)
-    state = session.get("state")
-
+    text = (event.message.body.text or "").strip()
     if text.startswith("/"):
         return
-    if state == "fuel_status":
-        await send_message(chat_id, "Выберите статус кнопкой.")
+    session = get_session(user_id)
+    if not session:
+        await lost(chat_id, user_id)
         return
-    if state == "photo":
-        await send_message(chat_id, "Отправьте фото или нажмите «Пропустить».")
-        return
-    if state == "remaining_pct":
-        try:
-            value = int(text)
-            fuel = session.get("current_fuel")
-            if not fuel or not 0 <= value <= 100:
-                raise ValueError
-            session["report"]["remaining_pct"][fuel["key"]] = value
-            await ask_remaining_l(chat_id, user_id)
-        except ValueError:
-            await send_message(chat_id, "Введите целое число от 0 до 100.")
-        return
-    if state == "remaining_l":
-        try:
-            value = int(text)
-            fuel = session.get("current_fuel")
-            if not fuel or not 0 <= value <= 1_000_000:
-                raise ValueError
-            session["report"]["remaining_l"][fuel["key"]] = value
-            await ask_price(chat_id, user_id)
-        except ValueError:
-            await send_message(chat_id, "Введите целое число от 0 до 1 000 000.")
-        return
-    if state == "price":
-        try:
-            value = float(text.replace(",", "."))
-            fuel = session.get("current_fuel")
-            if not fuel or not 0 <= value <= 500:
-                raise ValueError
-            session["report"]["prices"][fuel["key"]] = value
-            session["current_fuel_index"] += 1
-            await ask_fuel_status(chat_id, user_id)
-        except ValueError:
-            await send_message(chat_id, "Введите цену от 0 до 500 рублей.")
-        return
-    if state == "queue":
-        try:
-            value = int(text)
-            if not 0 <= value <= 1000:
-                raise ValueError
-            session["report"]["queue_length"] = value
-            await ask_restriction(chat_id, user_id)
-        except ValueError:
-            await send_message(chat_id, "Введите количество машин от 0 до 1000.")
-        return
-    if state == "note":
-        if len(text) > 200:
-            await send_message(chat_id, "Примечание должно быть не длиннее 200 символов.")
-            return
-        session["report"]["note"] = text
-        await show_summary(chat_id, user_id)
+    state = session["state"]
+    if state == "azs":
+        await screen_azs(chat_id, user_id, 0, query=text)
+    elif state == "details":
+        parse_details(session, text)
+        await screen_photo(chat_id, user_id)
+    elif state == "fuel":
+        await say(chat_id, "Отметьте топливо кнопками и нажмите «Готово».")
+    elif state == "photo":
+        session["note"] = (session["note"] + " " + text).strip()[:200]
+        await say(chat_id, "Записал в примечание. Пришлите фото или нажмите «Без фото».")
 
 
 @dp.message_callback()
-async def handle_callback(event: MessageCallback):
+async def on_callback(event: MessageCallback):
     chat_id = event.message.recipient.chat_id
     user_id = str(chat_id)
-    data = event.callback.payload
+    data = event.callback.payload or ""
     session = get_session(user_id)
 
-    if data == "start_report":
-        await show_azs_list(chat_id, user_id, 0)
+    if data == "azs_reload":
+        _azs_cache.update(rows=[], at=0.0)
+        await screen_azs(chat_id, user_id, 0)
         return
     if data.startswith("azspage_"):
-        await show_azs_list(chat_id, user_id, int(data.split("_", 1)[1]))
+        await screen_azs(chat_id, user_id, int(data.split("_", 1)[1]), query=(session or {}).get("query", ""))
         return
     if data.startswith("azs_"):
-        azs_id = int(data.split("_", 1)[1])
-        azs = next((item for item in azs_cache if item.get("id") == azs_id), None)
-        if not azs:
-            await send_message(chat_id, "Список АЗС изменился. Откройте его заново.")
+        rows, error = await fetch_azs()
+        if error:
+            await say(chat_id, f"Не удалось получить список АЗС: {error}.")
             return
-        session["report"]["azs_id"] = azs_id
-        session["azs_name"] = azs.get("name") or f"АЗС {azs_id}"
-        await ask_fuel_status(chat_id, user_id)
+        azs_id = int(data.split("_", 1)[1])
+        azs = next((r for r in rows if r.get("id") == azs_id), None)
+        if not azs:
+            await say(chat_id, "Эта АЗС больше не доступна — выберите из свежего списка.")
+            await screen_azs(chat_id, user_id, 0)
+            return
+        session = session or sessions.setdefault(user_id, new_session(user_id))
+        session["azs_id"] = azs_id
+        session["azs_name"] = str(azs.get("name") or f"АЗС {azs_id}")
+        await screen_fuel(chat_id, user_id)
         return
-    if data.startswith("fuel_"):
-        status = data.split("_", 1)[1]
-        fuel = session.get("current_fuel")
-        if fuel and status in STATUS_LABELS:
-            session["report"]["fuel_status"][fuel["key"]] = status
-            await ask_remaining_pct(chat_id, user_id)
+
+    if not session:
+        await lost(chat_id, user_id)
         return
-    if data.startswith("restriction_"):
-        restriction = data.split("_", 1)[1]
-        if restriction in RESTRICTIONS:
-            session["report"]["restriction_type"] = restriction
-            await ask_photo(chat_id, user_id)
+
+    if data.startswith("f_") and data not in ("f_done", "f_all_ok"):
+        key = data.split("_", 1)[1]
+        current = session["fuel_status"].get(key)
+        nxt = STATUS_CYCLE[(STATUS_CYCLE.index(current) + 1) % len(STATUS_CYCLE)] if current else STATUS_CYCLE[0]
+        session["fuel_status"][key] = nxt
+        await screen_fuel(chat_id, user_id)
         return
-    if data == "skip_remaining_pct":
-        await ask_remaining_l(chat_id, user_id)
+    if data == "f_all_ok":
+        session["fuel_status"] = {key: "available" for key, _ in FUEL_TYPES}
+        await screen_fuel(chat_id, user_id)
         return
-    if data == "skip_remaining_l":
-        await ask_price(chat_id, user_id)
+    if data == "f_done":
+        if not session["fuel_status"]:
+            await say(chat_id, "Отметьте хотя бы один вид топлива.")
+            return
+        await screen_details(chat_id, user_id)
         return
-    if data == "skip_price":
-        session["current_fuel_index"] += 1
-        await ask_fuel_status(chat_id, user_id)
+    if data == "d_skip":
+        await screen_photo(chat_id, user_id)
         return
-    if data == "skip_photo":
-        await ask_note(chat_id, user_id)
+    if data == "p_skip":
+        await screen_summary(chat_id, user_id)
         return
-    if data == "skip_note":
-        session["report"]["note"] = ""
-        await show_summary(chat_id, user_id)
+    if data == "again":
+        await screen_fuel(chat_id, user_id)
         return
-    if data == "confirm_send":
-        await send_message(chat_id, "Отправляю отчёт…")
-        success, message = await send_report_to_app(user_id)
-        if success:
-            await send_message(chat_id, f"Готово. {message}.")
-            user_sessions.pop(user_id, None)
+    if data == "cancel":
+        sessions.pop(user_id, None)
+        await say(chat_id, "Отчёт отменён. Напишите /start, чтобы начать заново.")
+        return
+    if data == "send":
+        if not session.get("azs_id"):
+            await say(chat_id, "АЗС не выбрана — начнём заново.")
+            await lost(chat_id, user_id)
+            return
+        if not session["fuel_status"]:
+            await say(chat_id, "Нет данных по топливу.")
+            await screen_fuel(chat_id, user_id)
+            return
+        await say(chat_id, "Отправляю…")
+        ok, message = await post_report(session)
+        if ok:
+            sessions.pop(user_id, None)
+            await say(chat_id, f"Готово: {message}. Напишите /start для следующего отчёта.")
         else:
-            keyboard = make_keyboard([[("Повторить", "confirm_send"), ("Отменить", "confirm_cancel")]])
-            await send_message(chat_id, f"Не удалось отправить: {message}", keyboard)
-        return
-    if data == "confirm_cancel":
-        user_sessions.pop(user_id, None)
-        await send_message(chat_id, "Отчёт отменён.")
-
-
-async def show_azs_list(chat_id: int, user_id: str, page: int):
-    azs, error = await fetch_azs()
-    if error:
-        await send_message(chat_id, f"Не удалось получить список АЗС: {error}")
-        return
-    if not azs:
-        await send_message(chat_id, "В приложении пока нет доступных АЗС.")
-        return
-    page_count = max(1, (len(azs) + AZS_PAGE_SIZE - 1) // AZS_PAGE_SIZE)
-    page = min(max(page, 0), page_count - 1)
-    start = page * AZS_PAGE_SIZE
-    rows = [[(str(item.get("name") or f"АЗС {item['id']}"), f"azs_{item['id']}")] for item in azs[start:start + AZS_PAGE_SIZE]]
-    navigation = []
-    if page > 0:
-        navigation.append(("Назад", f"azspage_{page - 1}"))
-    if page + 1 < page_count:
-        navigation.append(("Далее", f"azspage_{page + 1}"))
-    if navigation:
-        rows.append(navigation)
-    await send_message(chat_id, f"Выберите АЗС (страница {page + 1}/{page_count}):", make_keyboard(rows))
-
-
-async def ask_fuel_status(chat_id: int, user_id: str):
-    session = get_session(user_id)
-    index = session.get("current_fuel_index", 0)
-    if index >= len(FUEL_TYPES):
-        await ask_queue(chat_id, user_id)
-        return
-    fuel = FUEL_TYPES[index]
-    session["current_fuel"] = fuel
-    session["state"] = "fuel_status"
-    keyboard = make_keyboard([[("Есть", "fuel_available"), ("Нет", "fuel_unavailable"), ("Слив", "fuel_refueling")]])
-    await send_message(chat_id, f"Статус для {fuel['name']}:", keyboard)
-
-
-async def ask_remaining_pct(chat_id: int, user_id: str):
-    session = get_session(user_id)
-    session["state"] = "remaining_pct"
-    fuel = session["current_fuel"]
-    await send_message(chat_id, f"Остаток {fuel['name']} в процентах (0–100):", make_keyboard([[("Пропустить", "skip_remaining_pct")]]))
-
-
-async def ask_remaining_l(chat_id: int, user_id: str):
-    session = get_session(user_id)
-    session["state"] = "remaining_l"
-    fuel = session["current_fuel"]
-    await send_message(chat_id, f"Остаток {fuel['name']} в литрах:", make_keyboard([[("Пропустить", "skip_remaining_l")]]))
-
-
-async def ask_price(chat_id: int, user_id: str):
-    session = get_session(user_id)
-    session["state"] = "price"
-    fuel = session["current_fuel"]
-    await send_message(chat_id, f"Цена {fuel['name']}:", make_keyboard([[("Пропустить", "skip_price")]]))
-
-
-async def ask_queue(chat_id: int, user_id: str):
-    get_session(user_id)["state"] = "queue"
-    await send_message(chat_id, "Количество машин в очереди:")
-
-
-async def ask_restriction(chat_id: int, user_id: str):
-    get_session(user_id)["state"] = "restriction"
-    keyboard = make_keyboard([
-        [("Нет", "restriction_none"), ("До 20 л", "restriction_limit_20l")],
-        [("Только спецтранспорт", "restriction_special_only"), ("Закрыта", "restriction_closed")],
-    ])
-    await send_message(chat_id, "Есть ограничения?", keyboard)
-
-
-async def ask_photo(chat_id: int, user_id: str):
-    get_session(user_id)["state"] = "photo"
-    await send_message(chat_id, "Отправьте фото до 5 МБ:", make_keyboard([[("Пропустить", "skip_photo")]]))
-
-
-async def ask_note(chat_id: int, user_id: str):
-    get_session(user_id)["state"] = "note"
-    await send_message(chat_id, "Добавьте примечание до 200 символов:", make_keyboard([[("Пропустить", "skip_note")]]))
-
-
-async def show_summary(chat_id: int, user_id: str):
-    session = get_session(user_id)
-    report = session["report"]
-    lines = ["Итоговый отчёт", "", f"АЗС: {session.get('azs_name') or 'не выбрана'}"]
-    for fuel in FUEL_TYPES:
-        key = fuel["key"]
-        status = STATUS_LABELS.get(report["fuel_status"].get(key), "не указан")
-        details = [status]
-        if key in report["remaining_pct"]:
-            details.append(f"{report['remaining_pct'][key]}%")
-        if key in report["remaining_l"]:
-            details.append(f"{report['remaining_l'][key]} л")
-        if key in report["prices"]:
-            details.append(f"{report['prices'][key]} ₽")
-        lines.append(f"{fuel['name']}: {', '.join(details)}")
-    lines.extend([
-        "",
-        f"Очередь: {report['queue_length']} машин",
-        f"Ограничения: {RESTRICTIONS[report['restriction_type']]}",
-        f"Фото: {'добавлено' if report['photo_base64'] else 'нет'}",
-    ])
-    if report["note"]:
-        lines.append(f"Примечание: {report['note']}")
-    keyboard = make_keyboard([[("Отправить", "confirm_send"), ("Отменить", "confirm_cancel")]])
-    await send_message(chat_id, "\n".join(lines), keyboard)
+            await say(chat_id, f"Не удалось отправить: {message}",
+                      keyboard([[("Повторить", "send"), ("Отменить", "cancel")]]))
 
 
 async def main():
